@@ -1,0 +1,279 @@
+import { HorizontalBox, Slider, VerticalBox } from "std-widgets.slint";
+
+component ToolButton inherits Rectangle {
+    in property <string> label;
+    in property <int> value;
+    in property <int> selected;
+    callback clicked();
+    width: 34px;
+    height: 34px;
+    border-radius: 5px;
+    background: value == selected ? #3f4855 : #2b3038;
+    border-width: value == selected ? 1px : 0px;
+    border-color: #72b7ff;
+    animate background { duration: 120ms; }
+    Text {
+        text: root.label;
+        color: root.value == root.selected ? #ffffff : #c7ccd4;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+component ColorSwatch inherits Rectangle {
+    in property <color> swatch-color;
+    in property <color> selected-color;
+    callback clicked();
+    width: 25px;
+    height: 34px;
+    background: transparent;
+    Rectangle {
+        x: 4px;
+        y: 8px;
+        width: 17px;
+        height: 17px;
+        border-radius: 9px;
+        background: root.swatch-color;
+        border-width: root.swatch-color == root.selected-color ? 2px : 0px;
+        border-color: #ffffff;
+    }
+    TouchArea { clicked => { root.clicked(); } }
+}
+
+export component AppWindow inherits Window {
+    background: black;
+
+    in property <image> screenshot;
+    in property <image> committed-image;
+    in property <image> preview-image;
+    in-out property <int> phase: 0; // 0 = selecting, 2 = editing
+    in-out property <int> tool: 1;
+    in-out property <color> active-color: #ff3b30;
+    in-out property <int> line-width: 4;
+    property <float> slider-width: 4;
+
+    property <bool> drawing: false;
+    property <bool> selecting: false;
+    property <float> ax: 0;
+    property <float> ay: 0;
+    property <float> dx: 0;
+    property <float> dy: 0;
+    in-out property <float> sx: 0;
+    in-out property <float> sy: 0;
+    in-out property <float> sw: 0;
+    in-out property <float> sh: 0;
+    property <bool> has-selection: root.sw > 0.001 && root.sh > 0.001;
+
+    callback begin-mark(int, float, float, color, int);
+    callback update-mark(float, float);
+    callback commit-mark();
+    callback cancel-mark();
+    callback undo();
+    callback save();
+    callback copy();
+    callback cancel();
+
+    Image {
+        source: root.screenshot;
+        width: 100%;
+        height: 100%;
+        image-fit: fill;
+        z: 0;
+    }
+    Image {
+        source: root.committed-image;
+        width: 100%;
+        height: 100%;
+        image-fit: fill;
+        visible: root.phase == 2;
+        z: 1;
+    }
+    Image {
+        source: root.preview-image;
+        width: 100%;
+        height: 100%;
+        image-fit: fill;
+        visible: root.phase == 2 && root.drawing;
+        z: 2;
+    }
+
+    // The selection shade is live while dragging and remains after release.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: root.sy * root.height;
+        background: #00000099;
+        visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
+        z: 3;
+    }
+    Rectangle {
+        x: 0;
+        y: (root.sy + root.sh) * root.height;
+        width: 100%;
+        height: root.height - self.y;
+        background: #00000099;
+        visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
+        z: 3;
+    }
+    Rectangle {
+        x: 0;
+        y: root.sy * root.height;
+        width: root.sx * root.width;
+        height: root.sh * root.height;
+        background: #00000099;
+        visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
+        z: 3;
+    }
+    Rectangle {
+        x: (root.sx + root.sw) * root.width;
+        y: root.sy * root.height;
+        width: root.width - self.x;
+        height: root.sh * root.height;
+        background: #00000099;
+        visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
+        z: 3;
+    }
+
+    // The blue frame and corner handles make the live selection obvious.
+    Rectangle {
+        x: root.sx * root.width;
+        y: root.sy * root.height;
+        width: root.sw * root.width;
+        height: root.sh * root.height;
+        border-width: 2px;
+        border-color: #55aaff;
+        background: transparent;
+        visible: root.has-selection || root.selecting;
+        z: 4;
+        animate x, y, width, height { duration: 45ms; easing: ease-out; }
+    }
+    for handle in [0, 1, 2, 3]: Rectangle {
+        x: (handle == 1 || handle == 3 ? (root.sx + root.sw) * root.width : root.sx * root.width) - 4px;
+        y: (handle >= 2 ? (root.sy + root.sh) * root.height : root.sy * root.height) - 4px;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: #ffffff;
+        visible: root.has-selection;
+        z: 5;
+    }
+    if root.selecting && root.has-selection: Rectangle {
+        x: max(root.sx * root.width, 8px);
+        y: max(root.sy * root.height - 30px, 8px);
+        width: 116px;
+        height: 24px;
+        border-radius: 4px;
+        background: #20242bdd;
+        z: 6;
+        animate opacity { duration: 100ms; }
+        Text {
+            text: round(root.sw * root.width / 1px) + " × " + round(root.sh * root.height / 1px);
+            color: #ffffff;
+            font-size: 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    // One full-window input area drives both selection and drawing.
+    touch := TouchArea {
+        z: 10;
+        moved => {
+            if (self.pressed && root.phase == 0) {
+                root.dx = self.mouse-x / root.width;
+                root.dy = self.mouse-y / root.height;
+                root.sx = min(root.ax, root.dx);
+                root.sy = min(root.ay, root.dy);
+                root.sw = abs(root.dx - root.ax);
+                root.sh = abs(root.dy - root.ay);
+            }
+            if (self.pressed && root.phase == 2 && root.drawing) {
+                root.dx = clamp(self.mouse-x / root.width, root.sx, root.sx + root.sw);
+                root.dy = clamp(self.mouse-y / root.height, root.sy, root.sy + root.sh);
+                root.update-mark(root.dx, root.dy);
+            }
+        }
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.ax = self.mouse-x / root.width;
+                root.ay = self.mouse-y / root.height;
+                root.dx = root.ax;
+                root.dy = root.ay;
+                if (root.phase == 0) {
+                    root.selecting = true;
+                    root.sx = root.ax;
+                    root.sy = root.ay;
+                    root.sw = 0;
+                    root.sh = 0;
+                } else if (root.phase == 2 && root.ax >= root.sx && root.ax <= root.sx + root.sw && root.ay >= root.sy && root.ay <= root.sy + root.sh) {
+                    root.drawing = true;
+                    root.begin-mark(root.tool, root.ax, root.ay, root.active-color, root.line-width);
+                }
+            }
+            if (event.kind == PointerEventKind.up) {
+                if (root.phase == 0) {
+                    root.selecting = false;
+                    if (root.has-selection) {
+                        root.phase = 2;
+                    }
+                } else if (root.phase == 2 && root.drawing) {
+                    root.update-mark(root.dx, root.dy);
+                    root.commit-mark();
+                    root.drawing = false;
+                }
+            }
+        }
+    }
+
+    if root.phase == 2: toolbar := Rectangle {
+        x: max(min(root.sx * root.width, root.width - self.width), 8px);
+        y: min((root.sy + root.sh) * root.height + 10px, root.height - self.height - 10px);
+        width: min(720px, root.width - 20px);
+        height: 86px;
+        background: #20242b;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #48515d;
+        z: 20;
+        VerticalBox {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 7px;
+            padding-bottom: 7px;
+            spacing: 5px;
+            HorizontalBox {
+                spacing: 4px;
+                Text { text: "标注"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
+                ToolButton { label: "笔"; value: 1; selected: root.tool; clicked => { root.tool = 1; } }
+                ToolButton { label: "框"; value: 2; selected: root.tool; clicked => { root.tool = 2; } }
+                ToolButton { label: "圆"; value: 3; selected: root.tool; clicked => { root.tool = 3; } }
+                ToolButton { label: "线"; value: 4; selected: root.tool; clicked => { root.tool = 4; } }
+                ToolButton { label: "箭"; value: 5; selected: root.tool; clicked => { root.tool = 5; } }
+                ToolButton { label: "虚"; value: 6; selected: root.tool; clicked => { root.tool = 6; } }
+                Rectangle { width: 1px; height: 24px; background: #4b535e; horizontal-stretch: 0; }
+                Text { text: "颜色"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
+                ColorSwatch { swatch-color: #ff3b30; selected-color: root.active-color; clicked => { root.active-color = #ff3b30; } }
+                ColorSwatch { swatch-color: #ffd60a; selected-color: root.active-color; clicked => { root.active-color = #ffd60a; } }
+                ColorSwatch { swatch-color: #0a84ff; selected-color: root.active-color; clicked => { root.active-color = #0a84ff; } }
+                ColorSwatch { swatch-color: #34c759; selected-color: root.active-color; clicked => { root.active-color = #34c759; } }
+                ColorSwatch { swatch-color: #ffffff; selected-color: root.active-color; clicked => { root.active-color = #ffffff; } }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: "撤"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.undo(); } } }
+                Text { text: "存"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.save(); } } }
+                Text { text: "复"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.copy(); } } }
+                Text { text: "×"; color: #ff8b87; font-size: 18px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.cancel(); } } }
+            }
+            HorizontalBox {
+                spacing: 8px;
+                Text { text: "粗细"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
+                Slider { minimum: 1; maximum: 20; step: 1; value <=> root.slider-width; changed => { root.line-width = round(self.value); } height: 20px; horizontal-stretch: 1; }
+                Text { text: round(root.line-width) + " px"; color: #ffffff; font-size: 12px; vertical-alignment: center; width: 42px; horizontal-alignment: right; }
+                Rectangle { width: 1px; height: 20px; background: #4b535e; horizontal-stretch: 0; }
+                Text { text: root.tool == 1 ? "记号笔" : root.tool == 2 ? "矩形" : root.tool == 3 ? "椭圆" : root.tool == 4 ? "直线" : root.tool == 5 ? "箭头" : "虚线"; color: #dce2ea; font-size: 12px; vertical-alignment: center; width: 50px; }
+            }
+        }
+    }
+}

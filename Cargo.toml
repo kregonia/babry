@@ -1,0 +1,20 @@
+[package]
+name = "babry"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+image = "0.25"
+imageproc = "0.25"
+slint = "1.17"
+tempfile = "3"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
