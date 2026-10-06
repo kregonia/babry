@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-label="Babry logo">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="10" x2="142" y2="150" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#28c7fa"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="42" y1="34" x2="120" y2="126" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity=".96"/>
+      <stop offset="1" stop-color="#d7e9ff" stop-opacity=".78"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="144" height="144" rx="38" fill="#101318"/>
+  <rect x="12" y="12" width="136" height="136" rx="34" fill="url(#bg)" opacity=".95"/>
+  <rect x="29" y="29" width="102" height="102" rx="26" fill="#101318" opacity=".92"/>
+  <rect x="43" y="43" width="73" height="61" rx="9" fill="none" stroke="url(#glass)" stroke-width="7"/>
+  <path d="M43 104 64 83l16 14 15-18 21 25" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="7"/>
+  <circle cx="99" cy="61" r="7" fill="#ffd166"/>
+  <path d="M111 111h20M121 101v20" stroke="#fff" stroke-linecap="round" stroke-width="6"/>
+</svg>

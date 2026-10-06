@@ -1,4 +1,7 @@
-use std::{path::Path, process::Command};
+use std::{
+    path::Path,
+    process::{Command, Stdio},
+};
 
 pub fn capture(path: &Path) -> Result<(), String> {
     let status = Command::new("grim")
@@ -11,6 +14,15 @@ pub fn capture(path: &Path) -> Result<(), String> {
     } else {
         Err(format!("grim 截图失败: {status}"))
     }
+}
+
+pub fn notify(message: &str) {
+    let _ = Command::new("notify-send")
+        .args(["--app-name", "babry", "Babry", message])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 pub fn copy_png(path: &Path) -> Result<(), String> {

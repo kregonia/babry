@@ -1,80 +1,201 @@
-import { HorizontalBox, Slider, VerticalBox } from "std-widgets.slint";
+// 截图编辑界面：负责选区交互、工具栏和文字输入，图像检测与标注渲染通过回调交给 Rust。
+import { ComboBox, HorizontalBox, Slider, VerticalBox } from "std-widgets.slint";
 
-component ToolButton inherits Rectangle {
-    in property <string> label;
-    in property <int> value;
-    in property <int> selected;
-    callback clicked();
-    width: 34px;
-    height: 34px;
+// 通用图标按钮，供撤销、保存、贴图等操作复用。
+component IconButton inherits Rectangle {
+    in property <image> icon; // 按钮显示的图标。
+    in property <string> description; // 悬停提示与无障碍名称共用的说明文字。
+    in property <bool> selected: false; // 选中时显示背景和边框。
+    in property <bool> destructive: false; // 取消等操作使用红色图标提示。
+    callback clicked(); // 将点击事件转发给使用此按钮的组件。
+
+    width: 30px;
+    height: 30px;
     border-radius: 5px;
-    background: value == selected ? #3f4855 : #2b3038;
-    border-width: value == selected ? 1px : 0px;
-    border-color: #72b7ff;
-    animate background { duration: 120ms; }
-    Text {
-        text: root.label;
-        color: root.value == root.selected ? #ffffff : #c7ccd4;
-        font-size: 13px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    // 悬停、按下和选中使用不同背景；取消按钮保留红色提示。
+    background: button-touch.pressed ? (root.destructive ? #6b343a : #4b5c70)
+        : button-touch.has-hover ? (root.destructive ? #462c32 : root.selected ? #4a5768 : #333d4a)
+        : root.selected ? #3f4855 : transparent;
+    border-width: 1px;
+    border-color: root.selected ? #72b7ff
+        : button-touch.has-hover ? (root.destructive ? #ff8b87 : #738ca8) : transparent;
+    animate background, border-color { duration: 120ms; easing: ease-out; }
+    // 为辅助技术提供按钮角色与可读名称。
+    accessible-role: button;
+    accessible-label: root.description;
+
+    // 图标居中绘制，并根据操作类型统一着色。
+    Image {
+        source: root.icon;
+        width: 18px;
+        height: 18px;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        colorize: root.destructive ? (button-touch.has-hover ? #ffaaa6 : #ff8b87)
+            : button-touch.has-hover || root.selected ? #ffffff : #dce2ea;
     }
-    TouchArea { clicked => { root.clicked(); } }
+
+    // 点击区域覆盖整个按钮，提供悬停状态和手型光标，并转发点击事件。
+    button-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    // 鼠标悬停时展示操作说明。
+    Tooltip {
+        text: @markdown("\{root.description}");
+    }
 }
 
+// 标注工具按钮扩大点击区域，其余外观与交互继承通用图标按钮。
+component IconToolButton inherits IconButton {
+    width: 34px;
+    height: 34px;
+}
+
+// 颜色选择项，通过圆形色块与白色边框显示当前颜色。
 component ColorSwatch inherits Rectangle {
-    in property <color> swatch-color;
-    in property <color> selected-color;
-    callback clicked();
+    in property <color> swatch-color; // 此色块代表的颜色。
+    in property <color> selected-color; // 当前标注颜色，用于判断是否显示选中边框。
+    callback clicked(); // 点击后由调用方更新当前标注颜色。
+
     width: 25px;
     height: 34px;
-    background: transparent;
+    border-radius: 5px;
+    // 色块悬停时高亮点击区域，按下时加深背景。
+    background: swatch-touch.pressed ? #4b5c70 : swatch-touch.has-hover ? #333d4a : transparent;
+    animate background { duration: 120ms; easing: ease-out; }
+
+    // 色块小于点击区域，便于在紧凑的工具栏中操作。
     Rectangle {
-        x: 4px;
-        y: 8px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
         width: 17px;
         height: 17px;
         border-radius: 9px;
         background: root.swatch-color;
-        border-width: root.swatch-color == root.selected-color ? 2px : 0px;
-        border-color: #ffffff;
+        // 白圈表示已选颜色，蓝圈表示悬停中的未选颜色。
+        border-width: root.swatch-color == root.selected-color || swatch-touch.has-hover ? 2px : 0px;
+        border-color: root.swatch-color == root.selected-color ? #ffffff : #72b7ff;
     }
-    TouchArea { clicked => { root.clicked(); } }
+
+    swatch-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 }
 
+// 导出给 Rust 控制器的主窗口，统一管理选区阶段与标注阶段。
 export component AppWindow inherits Window {
+    title: "Babry";
     background: black;
+    // 默认将键盘焦点交给快捷键区域；文字输入框创建后会主动获取焦点。
+    forward-focus: keyboard;
 
-    in property <image> screenshot;
-    in property <image> committed-image;
-    in property <image> preview-image;
-    in-out property <int> phase: 0; // 0 = selecting, 2 = editing
+    // 三张图像由 Rust 提供，分别用于原始背景、已提交标注和当前操作预览。
+    in property <image> screenshot; // 未标注的原始截图。
+    in property <image> committed-image; // 根据撤销历史渲染的已提交画布。
+    in property <image> preview-image; // 在已提交画布上叠加待确认标注的预览。
+
+    // 阶段编号与 Rust 控制器约定一致；全屏截图模式可直接进入阶段 2。
+    in-out property <int> phase: 0; // 0：智能或手动选区；2：标注编辑。
+    // 工具编号：1 自由笔、2 矩形、3 椭圆、4 直线、5 箭头、6 虚线、7 高亮笔、8 效果、10 文字。
+    // 效果工具的模糊模式由 Rust 转换为内部标注类型 9。
     in-out property <int> tool: 1;
-    in-out property <color> active-color: #ff3b30;
-    in-out property <int> line-width: 4;
-    property <float> slider-width: 4;
+    in-out property <color> active-color: #ff3b30; // 当前标注颜色。
+    in-out property <int> line-width: 4; // 线条或笔刷粗细。
+    in-out property <float> text-font-size: 24; // 文字字号，单位为界面逻辑像素。
+    in-out property <string> text-font-family: ""; // 与导出渲染一致的字体族名称。
+    in-out property <int> effect-mode: 0; // 0：马赛克；1：模糊。
+    in-out property <float> blur-strength-value: 8; // 模糊强度，调用渲染回调时取整。
+    property <float> slider-width: 4; // 滑块使用浮点值，通过取整同步到整数粗细。
 
-    property <bool> drawing: false;
-    property <bool> selecting: false;
-    property <float> ax: 0;
-    property <float> ay: 0;
-    property <float> dx: 0;
-    property <float> dy: 0;
-    in-out property <float> sx: 0;
-    in-out property <float> sy: 0;
-    in-out property <float> sw: 0;
-    in-out property <float> sh: 0;
+    // 文字输入在确认前只更新预览，取消时丢弃待提交内容。
+    property <bool> text-editing: false; // 是否显示文字输入框。
+    in-out property <float> text-x: 0; // 文字落点的归一化横坐标。
+    in-out property <float> text-y: 0; // 文字落点的归一化纵坐标。
+    in-out property <string> text-value: ""; // 正在输入的文字内容。
+
+    // 所有画布坐标均相对整个截图归一化到 0～1，乘窗口宽高后用于界面布局。
+    property <bool> drawing: false; // 是否正在绘制尚未提交的标注。
+    property <bool> selecting: false; // 是否已从智能候选切换为手动拖框。
+    property <float> ax: 0; // 本次按下位置的横坐标，作为拖动起点。
+    property <float> ay: 0; // 本次按下位置的纵坐标。
+    property <float> dx: 0; // 最近一次移动位置的横坐标。
+    property <float> dy: 0; // 最近一次移动位置的纵坐标。
+    in-out property <float> sx: 0; // 选区左上角的横坐标，由 CV 回调或手动拖框更新。
+    in-out property <float> sy: 0; // 选区左上角的纵坐标。
+    in-out property <float> sw: 0; // 选区宽度占截图宽度的比例。
+    in-out property <float> sh: 0; // 选区高度占截图高度的比例。
+    // 过滤接近零尺寸的区域，只有宽高均超过阈值时才能确认选区。
     property <bool> has-selection: root.sw > 0.001 && root.sh > 0.001;
 
-    callback begin-mark(int, float, float, color, int);
-    callback update-mark(float, float);
-    callback commit-mark();
-    callback cancel-mark();
-    callback undo();
-    callback save();
-    callback copy();
-    callback cancel();
+    // 将鼠标的归一化坐标传给 Rust 的 CV 检测器，命中结果写回 sx、sy、sw、sh。
+    callback hover-selection(float, float);
+    // 参数依次为工具编号、起点横坐标、起点纵坐标、颜色、粗细、效果模式、模糊强度。
+    callback begin-mark(int, float, float, color, int, int, int);
+    callback update-mark(float, float); // 用归一化坐标更新端点或笔刷轨迹。
+    callback commit-mark(); // 结束当前标注，由 Rust 更新历史与已提交画布。
+    callback cancel-mark(); // 丢弃待提交标注，恢复已提交画布。
+    // 文字回调参数依次为归一化横坐标、归一化纵坐标、颜色、字号。
+    // 最后一个参数是从文字落点到选区右边缘的可用宽度比例。
+    callback begin-text(float, float, color, int, float);
+    callback update-text(string); // 输入变化时同步待提交文字。
+    callback update-text-style(color, int, float); // 颜色或字号变化时同步 Rust 标注样式。
+    callback commit-text(string); // 确认文字，由 Rust 将有效内容写入历史。
+    callback cancel-text(); // 取消文字预览。
+    callback undo(); // 撤销最近一次已提交标注。
+    callback redo(); // 重做已撤销的标注。
+    callback save(); // 导出选区并保存图片。
+    callback copy(); // 导出选区并复制到剪贴板。
+    callback pin(); // 导出选区并创建屏幕贴图。
+    callback cancel(); // 关闭截图编辑窗口。
 
+    // 提交当前文字但不关闭编辑器，供点击工具栏、保存或点击画布外部时复用。
+    function finish-text-input() {
+        if (root.text-editing) {
+            root.commit-text(root.text-value);
+            root.text-editing = false;
+            root.text-value = "";
+        }
+    }
+
+    // 切换到其他工具前先提交正在输入的文字；重复点击文字工具不打断输入。
+    function select-tool(value: int) {
+        if (root.tool != value) {
+            root.finish-text-input();
+            root.tool = value;
+        }
+    }
+
+    // 全局快捷键区域；文字输入框另行处理输入过程中的按键。
+    keyboard := FocusScope {
+        KeyBinding {
+            keys: @keys(Escape);
+            activated => {
+                // 取消顺序：文字输入、当前绘制、整个截图窗口。
+                if (root.text-editing) {
+                    root.cancel-text();
+                    root.text-editing = false;
+                    root.text-value = "";
+                } else if (root.drawing) {
+                    root.cancel-mark();
+                    root.drawing = false;
+                } else {
+                    root.cancel();
+                }
+            }
+        }
+        // 仅在编辑阶段且未输入文字时启用，避免与输入框的编辑操作冲突。
+        KeyBinding { keys: @keys(Control + Z); enabled: root.phase == 2 && !root.text-editing; activated => { root.undo(); } }
+        KeyBinding { keys: @keys(Control + Shift + Z); enabled: root.phase == 2 && !root.text-editing; activated => { root.redo(); } }
+        KeyBinding { keys: @keys(Control + Y); enabled: root.phase == 2 && !root.text-editing; activated => { root.redo(); } }
+        KeyBinding { keys: @keys(Control + S); enabled: root.phase == 2 && !root.text-editing; activated => { root.save(); } }
+        KeyBinding { keys: @keys(Control + C); enabled: root.phase == 2 && !root.text-editing; activated => { root.copy(); } }
+    }
+
+    // 图层从下到上依次为背景、已提交画布、预览、遮罩、选区边框和操作面板。
+    // 原始截图始终作为底图，选择阶段直接展示这张图像。
     Image {
         source: root.screenshot;
         width: 100%;
@@ -82,6 +203,7 @@ export component AppWindow inherits Window {
         image-fit: fill;
         z: 0;
     }
+    // 进入编辑阶段后显示已提交标注，撤销与重做会更新此图层。
     Image {
         source: root.committed-image;
         width: 100%;
@@ -90,16 +212,19 @@ export component AppWindow inherits Window {
         visible: root.phase == 2;
         z: 1;
     }
+    // 只有绘制或文字输入期间显示预览，确认后由已提交画布接替。
     Image {
         source: root.preview-image;
         width: 100%;
         height: 100%;
         image-fit: fill;
-        visible: root.phase == 2 && root.drawing;
+        // 文字输入由透明 TextInput 绘制，避免待提交位图文字与输入文字重叠。
+        visible: root.phase == 2 && root.drawing && !root.text-editing;
         z: 2;
     }
 
-    // The selection shade is live while dragging and remains after release.
+    // 四块半透明遮罩覆盖选区外侧，随智能吸附或手动拖框更新，进入编辑后继续保留。
+    // 上侧遮罩覆盖窗口全宽，下侧与左右遮罩共同留出透明的选区中心。
     Rectangle {
         x: 0;
         y: 0;
@@ -109,6 +234,7 @@ export component AppWindow inherits Window {
         visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
         z: 3;
     }
+    // 下侧遮罩从选区底边延伸到窗口底部。
     Rectangle {
         x: 0;
         y: (root.sy + root.sh) * root.height;
@@ -118,6 +244,7 @@ export component AppWindow inherits Window {
         visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
         z: 3;
     }
+    // 左侧遮罩只覆盖选区所在的高度，避免与上下遮罩叠加变暗。
     Rectangle {
         x: 0;
         y: root.sy * root.height;
@@ -127,6 +254,7 @@ export component AppWindow inherits Window {
         visible: (root.has-selection || root.selecting) && (root.phase == 0 || root.phase == 2);
         z: 3;
     }
+    // 右侧遮罩与左侧对称，从选区右边缘延伸到窗口右侧。
     Rectangle {
         x: (root.sx + root.sw) * root.width;
         y: root.sy * root.height;
@@ -137,7 +265,7 @@ export component AppWindow inherits Window {
         z: 3;
     }
 
-    // The blue frame and corner handles make the live selection obvious.
+    // 蓝色边框标出当前候选或已确认选区，短动画平滑显示位置与尺寸变化。
     Rectangle {
         x: root.sx * root.width;
         y: root.sy * root.height;
@@ -150,6 +278,7 @@ export component AppWindow inherits Window {
         z: 4;
         animate x, y, width, height { duration: 45ms; easing: ease-out; }
     }
+    // 四个圆点依次对应左上、右上、左下、右下，仅用于显示角点位置。
     for handle in [0, 1, 2, 3]: Rectangle {
         x: (handle == 1 || handle == 3 ? (root.sx + root.sw) * root.width : root.sx * root.width) - 4px;
         y: (handle >= 2 ? (root.sy + root.sh) * root.height : root.sy * root.height) - 4px;
@@ -160,7 +289,9 @@ export component AppWindow inherits Window {
         visible: root.has-selection;
         z: 5;
     }
-    if root.selecting && root.has-selection: Rectangle {
+    // 选择阶段在选区上方显示尺寸，提示位置距窗口左边和顶部至少 8px。
+    // 尺寸根据窗口宽高计算，单位为 Slint 逻辑像素。
+    if root.phase == 0 && root.has-selection: Rectangle {
         x: max(root.sx * root.width, 8px);
         y: max(root.sy * root.height - 30px, 8px);
         width: 116px;
@@ -168,7 +299,6 @@ export component AppWindow inherits Window {
         border-radius: 4px;
         background: #20242bdd;
         z: 6;
-        animate opacity { duration: 100ms; }
         Text {
             text: round(root.sw * root.width / 1px) + " × " + round(root.sh * root.height / 1px);
             color: #ffffff;
@@ -178,48 +308,81 @@ export component AppWindow inherits Window {
         }
     }
 
-    // One full-window input area drives both selection and drawing.
+    // 全窗口输入区域统一处理选区与绘制；工具栏和文字面板使用更高图层接收自身操作。
     touch := TouchArea {
         z: 10;
+        // moved 仅在鼠标按住或手指保持接触时触发，悬停移动由 pointer-event 处理。
         moved => {
-            if (self.pressed && root.phase == 0) {
-                root.dx = self.mouse-x / root.width;
-                root.dy = self.mouse-y / root.height;
-                root.sx = min(root.ax, root.dx);
-                root.sy = min(root.ay, root.dy);
-                root.sw = abs(root.dx - root.ax);
-                root.sh = abs(root.dy - root.ay);
+            if (root.phase == 0) {
+                root.dx = clamp(self.mouse-x / root.width, 0, 1);
+                root.dy = clamp(self.mouse-y / root.height, 0, 1);
+                // 任一方向移动至少 3px 时使用手动框选，微小抖动仍保留智能候选。
+                if (abs(self.mouse-x - self.pressed-x) >= 3px || abs(self.mouse-y - self.pressed-y) >= 3px) {
+                    root.selecting = true;
+                    // 取较小坐标与绝对距离，支持从任意角向相反方向拖框。
+                    root.sx = min(root.ax, root.dx);
+                    root.sy = min(root.ay, root.dy);
+                    root.sw = abs(root.dx - root.ax);
+                    root.sh = abs(root.dy - root.ay);
+                }
             }
-            if (self.pressed && root.phase == 2 && root.drawing) {
+            // 绘制时将轨迹钳制在已确认选区内，文字输入期间暂停画布绘制。
+            if (self.pressed && root.phase == 2 && root.drawing && !root.text-editing) {
                 root.dx = clamp(self.mouse-x / root.width, root.sx, root.sx + root.sw);
                 root.dy = clamp(self.mouse-y / root.height, root.sy, root.sy + root.sh);
                 root.update-mark(root.dx, root.dy);
             }
         }
         pointer-event(event) => {
-            if (event.kind == PointerEventKind.down) {
-                root.ax = self.mouse-x / root.width;
-                root.ay = self.mouse-y / root.height;
+            // 未按下鼠标时持续更新 CV 候选；按下后冻结候选，等待单击确认或手动拖框。
+            if (event.kind == PointerEventKind.move && root.phase == 0 && !self.pressed) {
+                root.hover-selection(
+                    clamp(self.mouse-x / root.width, 0, 1),
+                    clamp(self.mouse-y / root.height, 0, 1),
+                );
+            }
+            if (event.kind == PointerEventKind.down && root.phase == 2 && root.text-editing) {
+                // 文字输入框和工具栏位于更高图层；能到达画布的按下事件表示点击了外部。
+                root.finish-text-input();
+            } else if (event.kind == PointerEventKind.down) {
+                // 记录归一化起点，供手动选区、形状绘制和文字定位共同使用。
+                root.ax = clamp(self.mouse-x / root.width, 0, 1);
+                root.ay = clamp(self.mouse-y / root.height, 0, 1);
                 root.dx = root.ax;
                 root.dy = root.ay;
                 if (root.phase == 0) {
-                    root.selecting = true;
-                    root.sx = root.ax;
-                    root.sy = root.ay;
-                    root.sw = 0;
-                    root.sh = 0;
-                } else if (root.phase == 2 && root.ax >= root.sx && root.ax <= root.sx + root.sw && root.ay >= root.sy && root.ay <= root.sy + root.sh) {
-                    root.drawing = true;
-                    root.begin-mark(root.tool, root.ax, root.ay, root.active-color, root.line-width);
+                    // 按下时刷新一次候选，单击后可直接确认，不清空候选框尺寸。
+                    root.selecting = false;
+                    root.hover-selection(root.ax, root.ay);
+                } else if (root.phase == 2 && !root.text-editing && root.ax >= root.sx && root.ax <= root.sx + root.sw && root.ay >= root.sy && root.ay <= root.sy + root.sh) {
+                    // 仅允许在选区内开始标注；文字工具立即创建透明原位输入框。
+                    if (root.tool == 10) {
+                        root.text-x = clamp(root.ax, root.sx, root.sx + root.sw);
+                        root.text-y = clamp(root.ay, root.sy, root.sy + root.sh);
+                        root.text-value = "";
+                        root.text-editing = true;
+                        root.begin-text(
+                            root.text-x,
+                            root.text-y,
+                            root.active-color,
+                            round(root.text-font-size),
+                            max(0.001, root.sx + root.sw - root.text-x),
+                        );
+                    } else {
+                        root.drawing = true;
+                        root.begin-mark(root.tool, root.ax, root.ay, root.active-color, root.line-width, root.effect-mode, round(root.blur-strength-value));
+                    }
                 }
             }
             if (event.kind == PointerEventKind.up) {
                 if (root.phase == 0) {
+                    // 智能单击与手动拖框共用确认流程，有效选区进入编辑阶段。
                     root.selecting = false;
                     if (root.has-selection) {
                         root.phase = 2;
                     }
-                } else if (root.phase == 2 && root.drawing) {
+                } else if (root.phase == 2 && root.drawing && !root.text-editing) {
+                    // 用最近一次移动坐标收尾，提交标注后结束本次绘制。
                     root.update-mark(root.dx, root.dy);
                     root.commit-mark();
                     root.drawing = false;
@@ -228,51 +391,169 @@ export component AppWindow inherits Window {
         }
     }
 
+    // 文字输入直接覆盖在画布上：无背景、无边框，字号和颜色与最终标注一致。
+    // 宽度限制在当前选区内，输入内容自动换行并随字号增高；Ctrl+Enter 或点击外部提交。
+    if root.phase == 2 && root.text-editing: text-editor := Rectangle {
+        property <length> available-width: max(40px, (root.sx + root.sw - root.text-x) * root.width);
+        property <length> available-height: max(32px, (root.sy + root.sh - root.text-y) * root.height);
+        x: root.text-x * root.width;
+        y: root.text-y * root.height;
+        // 输入框随文字首行宽度增长，达到选区右边缘后改为逐字换行。
+        width: min(available-width, max(40px, text-input.preferred-width + 8px));
+        height: min(available-height, max(32px, text-input.preferred-height + 8px));
+        background: #00000018;
+        border-width: 1px;
+        border-color: #72b7ff88;
+        border-radius: 2px;
+        clip: true;
+        z: 30;
+
+        text-input := TextInput {
+            text <=> root.text-value;
+            x: 4px;
+            y: 3px;
+            width: max(1px, parent.width - 8px);
+            height: max(1px, parent.height - 6px);
+            font-size: root.text-font-size * 1px;
+            font-family: root.text-font-family;
+            color: root.active-color;
+            font-weight: 400;
+            wrap: char-wrap;
+            single-line: false;
+            vertical-alignment: top;
+            text-cursor-width: 2px;
+            selection-background-color: #72b7ff66;
+            selection-foreground-color: #ffffff;
+            edited => { root.update-text(self.text); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.cancel-text();
+                    root.text-editing = false;
+                    root.text-value = "";
+                    return accept;
+                }
+                if (event.text == Key.Return && event.modifiers.control) {
+                    root.commit-text(root.text-value);
+                    root.text-editing = false;
+                    root.text-value = "";
+                    return accept;
+                }
+                return reject;
+            }
+            init => { self.focus(); }
+        }
+    }
+
+    // 编辑工具栏优先放在选区下方，靠近窗口边缘时钳制位置；文字输入时仍保留以便调字号和颜色。
     if root.phase == 2: toolbar := Rectangle {
-        x: max(min(root.sx * root.width, root.width - self.width), 8px);
-        y: min((root.sy + root.sh) * root.height + 10px, root.height - self.height - 10px);
-        width: min(720px, root.width - 20px);
+        x: max(0px, min(root.sx * root.width, max(0px, root.width - self.width - 8px)));
+        y: max(0px, min((root.sy + root.sh) * root.height + 10px, max(0px, root.height - self.height - 10px)));
+        width: min(960px, max(1px, root.width - 16px));
+        // 总高度为上下各 8px 边距、34px 工具行、8px 行间距和 28px 参数行。
         height: 86px;
         background: #20242b;
         border-radius: 8px;
         border-width: 1px;
         border-color: #48515d;
-        z: 20;
+        // 工具栏位于文字框之上，保证字号、颜色和保存按钮可操作。
+        z: 40;
+
         VerticalBox {
-            padding-left: 8px;
-            padding-right: 8px;
-            padding-top: 7px;
-            padding-bottom: 7px;
-            spacing: 5px;
+            padding: 8px;
+            spacing: 8px;
+
+            // 清除行布局的主题默认内边距，避免与外层边距叠加后挤出工具栏。
+            // 第一行依次排列标注工具、颜色与历史及导出操作，所有控件垂直居中。
             HorizontalBox {
-                spacing: 4px;
+                height: 34px;
+                padding: 0px;
+                cross-axis-alignment: center;
+                spacing: 3px;
                 Text { text: "标注"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
-                ToolButton { label: "笔"; value: 1; selected: root.tool; clicked => { root.tool = 1; } }
-                ToolButton { label: "框"; value: 2; selected: root.tool; clicked => { root.tool = 2; } }
-                ToolButton { label: "圆"; value: 3; selected: root.tool; clicked => { root.tool = 3; } }
-                ToolButton { label: "线"; value: 4; selected: root.tool; clicked => { root.tool = 4; } }
-                ToolButton { label: "箭"; value: 5; selected: root.tool; clicked => { root.tool = 5; } }
-                ToolButton { label: "虚"; value: 6; selected: root.tool; clicked => { root.tool = 6; } }
+                IconToolButton { icon: @image-url("static/pen.svg"); description: "自由笔"; selected: root.tool == 1; clicked => { root.select-tool(1); } }
+                IconToolButton { icon: @image-url("static/rectangle.svg"); description: "矩形"; selected: root.tool == 2; clicked => { root.select-tool(2); } }
+                IconToolButton { icon: @image-url("static/ellipse.svg"); description: "椭圆"; selected: root.tool == 3; clicked => { root.select-tool(3); } }
+                IconToolButton { icon: @image-url("static/line.svg"); description: "直线"; selected: root.tool == 4; clicked => { root.select-tool(4); } }
+                IconToolButton { icon: @image-url("static/arrow.svg"); description: "箭头"; selected: root.tool == 5; clicked => { root.select-tool(5); } }
+                IconToolButton { icon: @image-url("static/dashed.svg"); description: "虚线"; selected: root.tool == 6; clicked => { root.select-tool(6); } }
+                IconToolButton { icon: @image-url("static/highlight.svg"); description: "高亮笔"; selected: root.tool == 7; clicked => { root.select-tool(7); } }
+                IconToolButton { icon: @image-url("static/effects.svg"); description: "效果：马赛克或模糊"; selected: root.tool == 8; clicked => { root.select-tool(8); } }
+                IconToolButton { icon: @image-url("static/mark.svg"); description: "文字"; selected: root.tool == 10; clicked => { root.select-tool(10); } }
                 Rectangle { width: 1px; height: 24px; background: #4b535e; horizontal-stretch: 0; }
+                // 色块共享 active-color，输入文字时也立即更新文字颜色。
                 Text { text: "颜色"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
-                ColorSwatch { swatch-color: #ff3b30; selected-color: root.active-color; clicked => { root.active-color = #ff3b30; } }
-                ColorSwatch { swatch-color: #ffd60a; selected-color: root.active-color; clicked => { root.active-color = #ffd60a; } }
-                ColorSwatch { swatch-color: #0a84ff; selected-color: root.active-color; clicked => { root.active-color = #0a84ff; } }
-                ColorSwatch { swatch-color: #34c759; selected-color: root.active-color; clicked => { root.active-color = #34c759; } }
-                ColorSwatch { swatch-color: #ffffff; selected-color: root.active-color; clicked => { root.active-color = #ffffff; } }
+                ColorSwatch { swatch-color: #ff3b30; selected-color: root.active-color; clicked => { root.active-color = #ff3b30; root.update-text-style(root.active-color, root.text-font-size, max(0.001, root.sx + root.sw - root.text-x)); } }
+                ColorSwatch { swatch-color: #ffd60a; selected-color: root.active-color; clicked => { root.active-color = #ffd60a; root.update-text-style(root.active-color, root.text-font-size, max(0.001, root.sx + root.sw - root.text-x)); } }
+                ColorSwatch { swatch-color: #0a84ff; selected-color: root.active-color; clicked => { root.active-color = #0a84ff; root.update-text-style(root.active-color, root.text-font-size, max(0.001, root.sx + root.sw - root.text-x)); } }
+                ColorSwatch { swatch-color: #34c759; selected-color: root.active-color; clicked => { root.active-color = #34c759; root.update-text-style(root.active-color, root.text-font-size, max(0.001, root.sx + root.sw - root.text-x)); } }
+                ColorSwatch { swatch-color: #ffffff; selected-color: root.active-color; clicked => { root.active-color = #ffffff; root.update-text-style(root.active-color, root.text-font-size, max(0.001, root.sx + root.sw - root.text-x)); } }
+                // 弹性空白将历史与导出按钮推向工具栏右侧。
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: "撤"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.undo(); } } }
-                Text { text: "存"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.save(); } } }
-                Text { text: "复"; color: #c7ccd4; font-size: 13px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.copy(); } } }
-                Text { text: "×"; color: #ff8b87; font-size: 18px; vertical-alignment: center; width: 24px; horizontal-alignment: center; TouchArea { clicked => { root.cancel(); } } }
+                IconButton { icon: @image-url("static/undo.svg"); description: "撤销"; clicked => { root.finish-text-input(); root.undo(); } }
+                IconButton { icon: @image-url("static/redo.svg"); description: "重做"; clicked => { root.finish-text-input(); root.redo(); } }
+                IconButton { icon: @image-url("static/save.svg"); description: "保存"; clicked => { root.finish-text-input(); root.save(); } }
+                IconButton { icon: @image-url("static/copy.svg"); description: "复制"; clicked => { root.finish-text-input(); root.copy(); } }
+                IconButton { icon: @image-url("static/pin.svg"); description: "贴图"; clicked => { root.finish-text-input(); root.pin(); } }
+                IconButton { icon: @image-url("static/cancle.svg"); description: "取消截图"; destructive: true; clicked => { root.cancel(); } }
             }
+
+            // 第二行预留完整的文字与控件高度，普通工具和模糊工具使用相同行高。
             HorizontalBox {
+                height: 28px;
+                padding: 0px;
+                cross-axis-alignment: center;
                 spacing: 8px;
-                Text { text: "粗细"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
-                Slider { minimum: 1; maximum: 20; step: 1; value <=> root.slider-width; changed => { root.line-width = round(self.value); } height: 20px; horizontal-stretch: 1; }
-                Text { text: round(root.line-width) + " px"; color: #ffffff; font-size: 12px; vertical-alignment: center; width: 42px; horizontal-alignment: right; }
+                // 普通标注工具显示线条粗细；文字工具改用独立字号控制。
+                if root.tool != 10: Text { text: "粗细"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
+                if root.tool != 10: Slider {
+                    minimum: 1;
+                    maximum: 20;
+                    step: 1;
+                    value <=> root.slider-width;
+                    changed => { root.line-width = round(self.value); }
+                    height: 20px;
+                    horizontal-stretch: 1;
+                }
+                if root.tool != 10: Text { text: round(root.line-width) + " px"; color: #ffffff; font-size: 12px; vertical-alignment: center; width: 42px; horizontal-alignment: right; }
+                // 文字工具使用独立字号；其他工具不显示文字字号控件。
+                if root.tool == 10: Text { text: "字号"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 34px; }
+                if root.tool == 10: Slider {
+                    minimum: 12;
+                    maximum: 72;
+                    step: 1;
+                    value <=> root.text-font-size;
+                    width: 150px;
+                    height: 20px;
+                    changed => { root.update-text-style(root.active-color, round(self.value), max(0.001, root.sx + root.sw - root.text-x)); }
+                }
+                if root.tool == 10: Text { text: round(root.text-font-size) + " px"; color: #ffffff; font-size: 12px; vertical-alignment: center; width: 48px; horizontal-alignment: right; }
+                // 效果工具显示模式选择：“格”为马赛克，“糊”为模糊，索引对应 effect-mode。
+                if root.tool == 8: ComboBox {
+                    model: ["格", "糊"];
+                    current-index <=> root.effect-mode;
+                    width: 86px;
+                    height: 26px;
+                }
+                // 模糊强度与笔刷粗细独立，仅在模糊模式显示。
+                if root.tool == 8 && root.effect-mode == 1: Text { text: "模糊度"; color: #8e98a6; font-size: 11px; vertical-alignment: center; width: 42px; }
+                if root.tool == 8 && root.effect-mode == 1: Slider {
+                    minimum: 1;
+                    maximum: 20;
+                    step: 1;
+                    value <=> root.blur-strength-value;
+                    width: 120px;
+                    height: 20px;
+                }
+                if root.tool == 8 && root.effect-mode == 1: Text { text: round(root.blur-strength-value); color: #ffffff; font-size: 12px; vertical-alignment: center; width: 24px; horizontal-alignment: right; }
                 Rectangle { width: 1px; height: 20px; background: #4b535e; horizontal-stretch: 0; }
-                Text { text: root.tool == 1 ? "记号笔" : root.tool == 2 ? "矩形" : root.tool == 3 ? "椭圆" : root.tool == 4 ? "直线" : root.tool == 5 ? "箭头" : "虚线"; color: #dce2ea; font-size: 12px; vertical-alignment: center; width: 50px; }
+                // 根据工具编号和效果模式展示当前工具名称。
+                Text {
+                    text: root.tool == 1 ? "自由笔" : root.tool == 2 ? "矩形" : root.tool == 3 ? "椭圆" : root.tool == 4 ? "直线" : root.tool == 5 ? "箭头" : root.tool == 6 ? "虚线" : root.tool == 7 ? "高亮笔" : root.tool == 8 ? (root.effect-mode == 0 ? "马赛克" : "模糊") : "文字";
+                    color: #dce2ea;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    width: 58px;
+                }
             }
         }
     }
