@@ -5,43 +5,55 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+        # 两种架构分别原生构建，避免交叉编译误用宿主机的系统库。
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install ARM64 linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfontconfig-dev libxkbcommon-dev libwayland-dev
 
       - name: Build release binary
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Verify release binary
+        run: |
+          file target/${{ matrix.target }}/release/babry
+          target/${{ matrix.target }}/release/babry --help
 
       - name: Upload binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/
+          path: target/${{ matrix.target }}/release/babry
           if-no-files-found: error
