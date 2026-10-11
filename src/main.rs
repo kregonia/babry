@@ -18,6 +18,9 @@ use std::{
 
 slint::include_modules!();
 
+#[cfg(test)]
+mod ui_tests;
+
 type SharedMarks = Rc<RefCell<History<NativeMark>>>;
 type PendingMark = Rc<RefCell<Option<NativeMark>>>;
 type RenderCache = Rc<RefCell<PreviewCache>>;
@@ -75,7 +78,7 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
         return Err("截图尺寸为空".to_string());
     }
 
-    let base_image = Rc::new(base);
+    let base_image = Arc::new(base);
     let app = AppWindow::new().map_err(|error| error.to_string())?;
     slint::set_xdg_app_id("babry").map_err(|error| error.to_string())?;
     app.window()
@@ -94,22 +97,22 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
         app.set_sh(1.0);
         app.set_phase(2);
     } else {
-        let detector = Rc::new(RegionDetector::new(base_image.as_ref()));
-        let cursor = Rc::new(RefCell::new(SelectionCursor::default()));
+        app.set_selection_loading(true);
         let weak = app.as_weak();
-        let hover_detector = detector.clone();
-        let hover_cursor = cursor.clone();
-        app.on_hover_selection(move |x, y| {
-            let Some(app) = weak.upgrade() else { return };
-            let region = hover_cursor.borrow_mut().hover(&hover_detector, x, y);
-            set_selection(&app, &hover_detector, region);
-        });
-        let weak = app.as_weak();
-        app.on_cycle_selection(move |x, y, direction| {
-            let Some(app) = weak.upgrade() else { return };
-            let region = cursor.borrow_mut().step(&detector, x, y, direction);
-            set_selection(&app, &detector, region);
-        });
+        let snapshot = base_image.clone();
+        // 与界面共享原图，不为工作线程复制整屏；分析期间仍可手动拖框。
+        std::thread::Builder::new()
+            .name("babry-selection".into())
+            .spawn(move || {
+                let detector = RegionDetector::new(&snapshot);
+                let _ = weak.upgrade_in_event_loop(move |app| {
+                    app.set_selection_loading(false);
+                    if app.get_phase() == 0 {
+                        install_selection_detector(&app, detector);
+                    }
+                });
+            })
+            .map_err(|error| format!("无法启动选区分析: {error}"))?;
     }
 
     let committed: SharedMarks = Rc::new(RefCell::new(History::default()));
@@ -344,6 +347,27 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
     app.run().map_err(|error| error.to_string())
 }
 
+fn install_selection_detector(app: &AppWindow, detector: RegionDetector) {
+    let detector = Rc::new(detector);
+    let cursor = Rc::new(RefCell::new(SelectionCursor::default()));
+    let weak = app.as_weak();
+    let hover_detector = detector.clone();
+    let hover_cursor = cursor.clone();
+    app.on_hover_selection(move |x, y| {
+        let Some(app) = weak.upgrade() else { return };
+        let region = hover_cursor.borrow_mut().hover(&hover_detector, x, y);
+        set_selection(&app, &hover_detector, region);
+    });
+    let weak = app.as_weak();
+    app.on_cycle_selection(move |x, y, direction| {
+        let Some(app) = weak.upgrade() else { return };
+        let region = cursor.borrow_mut().step(&detector, x, y, direction);
+        set_selection(&app, &detector, region);
+    });
+    // 如果指针已移动而尚未按下，结果到达时立即更新；不覆盖正在拖动的选区。
+    app.invoke_refresh_selection();
+}
+
 // 候选切换只写回归一化坐标，界面不需要了解检测来源和评分。
 fn set_selection(app: &AppWindow, detector: &RegionDetector, rect: babry::core::RectPx) {
     let (sx, sy, sw, sh) = rect.to_normalized(detector.image_width(), detector.image_height());
@@ -357,7 +381,7 @@ fn make_export_action(
     app: &AppWindow,
     source: &Path,
     committed: &SharedMarks,
-    _base: Rc<RgbaImage>,
+    _base: Arc<RgbaImage>,
     copy_to_clipboard: bool,
 ) -> impl Fn() + 'static {
     let weak = app.as_weak();
@@ -395,7 +419,7 @@ fn make_pin_action(
     app: &AppWindow,
     source: &Path,
     committed: &SharedMarks,
-    _base: Rc<RgbaImage>,
+    _base: Arc<RgbaImage>,
 ) -> impl Fn() + 'static {
     let weak = app.as_weak();
     let source = source.to_path_buf();

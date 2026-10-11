@@ -185,6 +185,9 @@ fn edge_field(image: &RgbaImage) -> EdgeField {
         })
         .unwrap_or(12);
     let threshold = (percentile / 2).clamp(5, 18);
+    // 密集亮文字不能掩盖连续弱边框；弱色差仅沿足够长的同方向线段提升。
+    let weak_vertical = weak_lines(&vertical, &horizontal, true);
+    let weak_horizontal = weak_lines(&horizontal, &vertical, false);
     let high = (f32::from(threshold) * 3.0).clamp(15.0, 54.0);
     let gray = imageops::grayscale(image);
     let mut combined = canny(&gray, high * 0.4, high);
@@ -194,20 +197,24 @@ fn edge_field(image: &RgbaImage) -> EdgeField {
             let gy = horizontal[(x, y)][0];
             // 色差边缘补充灰度无法识别的等亮度色块。
             vertical[(x, y)] = Luma([
-                if gx >= threshold && u16::from(gx) * 4 >= u16::from(gy) * 3 {
+                if (gx >= threshold && u16::from(gx) * 4 >= u16::from(gy) * 3)
+                    || weak_vertical[(x, y)][0] != 0
+                {
                     255
                 } else {
                     0
                 },
             ]);
             horizontal[(x, y)] = Luma([
-                if gy >= threshold && u16::from(gy) * 4 >= u16::from(gx) * 3 {
+                if (gy >= threshold && u16::from(gy) * 4 >= u16::from(gx) * 3)
+                    || weak_horizontal[(x, y)][0] != 0
+                {
                     255
                 } else {
                     0
                 },
             ]);
-            if gx.max(gy) >= threshold {
+            if gx.max(gy) >= threshold || vertical[(x, y)][0] != 0 || horizontal[(x, y)][0] != 0 {
                 combined[(x, y)] = Luma([255]);
             }
         }
@@ -218,6 +225,44 @@ fn edge_field(image: &RgbaImage) -> EdgeField {
         combined,
         threshold,
     }
+}
+
+fn weak_lines(gradient: &GrayImage, other: &GrayImage, vertical: bool) -> GrayImage {
+    let (width, height) = gradient.dimensions();
+    let mut mask = GrayImage::new(width, height);
+    let (across, along) = if vertical {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    for fixed in 0..across {
+        let mut start = None;
+        for position in 0..=along {
+            let (x, y) = if vertical {
+                (fixed, position)
+            } else {
+                (position, fixed)
+            };
+            let hit = position < along
+                && gradient[(x, y)][0] >= 5
+                && u16::from(gradient[(x, y)][0]) * 4 >= u16::from(other[(x, y)][0]) * 3;
+            if hit {
+                start.get_or_insert(position);
+            } else if let Some(first) = start.take()
+                && position - first >= 24
+            {
+                for along in first..position {
+                    let (x, y) = if vertical {
+                        (fixed, along)
+                    } else {
+                        (along, fixed)
+                    };
+                    mask[(x, y)] = Luma([255]);
+                }
+            }
+        }
+    }
+    mask
 }
 
 fn contour_proposals(edges: &GrayImage) -> Vec<Proposal> {

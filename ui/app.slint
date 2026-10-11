@@ -99,6 +99,8 @@ export component AppWindow inherits Window {
 
     // 阶段编号与 Rust 控制器约定一致；全屏截图模式可直接进入阶段 2。
     in-out property <int> phase: 0; // 0：智能或手动选区；2：标注编辑。
+    in property <bool> selection-loading: false; // 后台分析时允许手动拖框。
+    property <bool> selection-pointer-known: false; // 结果到达时用最近一次悬停位置刷新。
     // 工具编号：1 自由笔、2 矩形、3 椭圆、4 直线、5 箭头、6 虚线、7 高亮笔、8 效果、10 文字。
     // 效果工具的模糊模式由 Rust 转换为内部标注类型 9。
     in-out property <int> tool: 1;
@@ -133,6 +135,12 @@ export component AppWindow inherits Window {
     // 将鼠标的归一化坐标传给 Rust 的 CV 检测器，命中结果写回 sx、sy、sw、sh。
     callback hover-selection(float, float);
     callback cycle-selection(float, float, int); // 滚轮向上扩大到父区域，向下缩小到子区域。
+    callback refresh-selection();
+    refresh-selection => {
+        if (root.phase == 0 && root.selection-pointer-known && !touch.pressed) {
+            root.hover-selection(root.dx, root.dy);
+        }
+    }
     // 参数依次为工具编号、起点横坐标、起点纵坐标、颜色、粗细、效果模式、模糊强度。
     callback begin-mark(int, float, float, color, int, int, int);
     callback update-mark(float, float); // 用归一化坐标更新端点或笔刷轨迹。
@@ -309,6 +317,23 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.phase == 0 && root.selection-loading: Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - 24px;
+        width: 270px;
+        height: 36px;
+        border-radius: 6px;
+        background: #20242bdd;
+        z: 6;
+        Text {
+            text: "正在寻找选区，可直接拖动框选";
+            color: #ffffff;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
     // 全窗口输入区域统一处理选区与绘制；工具栏和文字面板使用更高图层接收自身操作。
     touch := TouchArea {
         z: 10;
@@ -348,10 +373,10 @@ export component AppWindow inherits Window {
         pointer-event(event) => {
             // 未按下鼠标时持续更新 CV 候选；按下后冻结候选，等待单击确认或手动拖框。
             if (event.kind == PointerEventKind.move && root.phase == 0 && !self.pressed) {
-                root.hover-selection(
-                    clamp(self.mouse-x / root.width, 0, 1),
-                    clamp(self.mouse-y / root.height, 0, 1),
-                );
+                root.dx = clamp(self.mouse-x / root.width, 0, 1);
+                root.dy = clamp(self.mouse-y / root.height, 0, 1);
+                root.selection-pointer-known = true;
+                root.hover-selection(root.dx, root.dy);
             }
             if (event.kind == PointerEventKind.down && root.phase == 2 && root.text-editing) {
                 // 文字输入框和工具栏位于更高图层；能到达画布的按下事件表示点击了外部。

@@ -115,9 +115,15 @@ impl RegionDetector {
     }
 }
 
-// 弱候选不会仅凭面积小抢走强候选；面积使用四次方根，减弱尺寸偏置。
+// 可靠边界先进入优先级，再按尺度选择；弱小碎片不能抢走完整控件或面板。
+// 同一质量层级使用四次方根面积，仍能优先命中较小的有效子区域。
 fn candidate_rank(candidate: &RegionCandidate) -> f32 {
-    (area(candidate.rect) as f32).sqrt().sqrt() / candidate.quality.max(0.1).powi(4)
+    let tier = if candidate.quality >= 0.80 {
+        0.0
+    } else {
+        10_000.0
+    };
+    tier + (area(candidate.rect) as f32).sqrt().sqrt() / candidate.quality.max(0.1).powi(2)
 }
 
 fn area(rect: RectPx) -> u64 {
