@@ -11,6 +11,7 @@
     <a href="https://github.com/kregonia/babry/actions/workflows/cargo-linux-multiarch.yml"><img src="https://github.com/kregonia/babry/actions/workflows/cargo-linux-multiarch.yml/badge.svg" alt="Build status"></a>
     <a href="https://github.com/kregonia/babry/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-7c5cff.svg" alt="Apache-2.0 license"></a>
     <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584.svg" alt="Built with Rust"></a>
+    <a href="https://aur.archlinux.org/packages/babry-bin"><img src="https://img.shields.io/aur/version/babry-bin" alt="AUR babry-bin version"></a>
     <a href="https://github.com/kregonia/babry/stargazers"><img src="https://img.shields.io/github/stars/kregonia/babry?style=flat&color=ffd166" alt="GitHub stars"></a>
   </p>
 
@@ -83,41 +84,51 @@
 
 ## 快速开始
 
-### 1. 安装运行依赖
+### 1. 安装 Babry
 
-Babry 需要一个 Wayland 截图后端和剪贴板工具：
-
-```text
-grim
-wl-clipboard
-```
-
-可选的 `notify-send` 用于状态通知。
-
-Arch Linux：
+Arch Linux 及其衍生发行版用户可以通过 AUR 安装二进制包 [babry-bin](https://aur.archlinux.org/packages/babry-bin)，无需本地编译 Rust：
 
 ```bash
-sudo pacman -S grim wl-clipboard libnotify
+yay -S babry-bin
+# 或
+paru -S babry-bin
 ```
 
-### 2. 构建
+如果已配置提供 `babry-bin` 的二进制软件仓库，也可以使用：
+
+```bash
+sudo pacman -S babry-bin
+```
+
+`pacman` 不直接从 AUR 安装软件；仅使用 AUR 时，请选择上面的 `yay` 或 `paru` 命令。
+
+<details>
+<summary>从源码构建</summary>
+
+安装 Rust 工具链及对应发行版的构建依赖后执行：
 
 ```bash
 git clone https://github.com/kregonia/babry.git
 cd babry
-cargo build --release
+cargo build --release --locked
 ```
 
-生成的二进制文件：
-
-```text
-target/release/babry
-```
-
-将它放入 `PATH`：
+生成的二进制文件为 `target/release/babry`。将它放入 `PATH`：
 
 ```bash
 install -Dm755 target/release/babry ~/.local/bin/babry
+```
+
+</details>
+
+### 2. 安装运行依赖
+
+截图需要 `grim`，复制图片需要 `wl-clipboard`；可选的 `notify-send` 用于状态通知。AUR 包已声明 Fontconfig、xkbcommon 和 Wayland 系统库依赖，截图和剪贴板工具请按需安装。
+
+Arch Linux：
+
+```bash
+yay -S grim wl-clipboard libnotify
 ```
 
 ### 3. 开始截图
