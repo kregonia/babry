@@ -132,6 +132,7 @@ export component AppWindow inherits Window {
 
     // 将鼠标的归一化坐标传给 Rust 的 CV 检测器，命中结果写回 sx、sy、sw、sh。
     callback hover-selection(float, float);
+    callback cycle-selection(float, float, int); // 滚轮向上扩大到父区域，向下缩小到子区域。
     // 参数依次为工具编号、起点横坐标、起点纵坐标、颜色、粗细、效果模式、模糊强度。
     callback begin-mark(int, float, float, color, int, int, int);
     callback update-mark(float, float); // 用归一化坐标更新端点或笔刷轨迹。
@@ -333,6 +334,17 @@ export component AppWindow inherits Window {
                 root.update-mark(root.dx, root.dy);
             }
         }
+        scroll-event(event) => {
+            if (root.phase == 0 && !self.pressed && event.delta-y != 0px) {
+                root.cycle-selection(
+                    clamp(self.mouse-x / root.width, 0, 1),
+                    clamp(self.mouse-y / root.height, 0, 1),
+                    event.delta-y > 0px ? 1 : -1,
+                );
+                return accept;
+            }
+            return reject;
+        }
         pointer-event(event) => {
             // 未按下鼠标时持续更新 CV 候选；按下后冻结候选，等待单击确认或手动拖框。
             if (event.kind == PointerEventKind.move && root.phase == 0 && !self.pressed) {
@@ -391,7 +403,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    // 文字输入直接覆盖在画布上：无背景、无边框，字号和颜色与最终标注一致。
+    // 文字输入直接覆盖在画布上：浅透明背景与细边框标出输入范围，字号和颜色与最终标注一致。
     // 宽度限制在当前选区内，输入内容自动换行并随字号增高；Ctrl+Enter 或点击外部提交。
     if root.phase == 2 && root.text-editing: text-editor := Rectangle {
         property <length> available-width: max(40px, (root.sx + root.sw - root.text-x) * root.width);

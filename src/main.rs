@@ -1,5 +1,10 @@
 use ab_glyph::Font;
-use babry::{capture, cli, core::History, editor, pin, selection::RegionDetector};
+use babry::{
+    capture, cli,
+    core::History,
+    editor, pin,
+    selection::{self, RegionDetector, SelectionCursor},
+};
 use editor::Mark as NativeMark;
 use image::{Rgba, RgbaImage};
 use slint::{ComponentHandle, PhysicalSize, SharedPixelBuffer};
@@ -45,6 +50,9 @@ fn dispatch() -> Result<(), String> {
         cli::Command::Screen => run_capture(true),
         cli::Command::Pin(path) => pin::launch(&path),
         cli::Command::PinSurface(path) => pin::run_surface(&path),
+        cli::Command::DebugSelection { source, directory } => {
+            selection::write_diagnostics(&source, &directory)
+        }
     }
 }
 
@@ -87,16 +95,20 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
         app.set_phase(2);
     } else {
         let detector = Rc::new(RegionDetector::new(base_image.as_ref()));
+        let cursor = Rc::new(RefCell::new(SelectionCursor::default()));
         let weak = app.as_weak();
+        let hover_detector = detector.clone();
+        let hover_cursor = cursor.clone();
         app.on_hover_selection(move |x, y| {
             let Some(app) = weak.upgrade() else { return };
-            let region = detector.region_at(x, y);
-            let (sx, sy, sw, sh) =
-                region.to_normalized(detector.image_width(), detector.image_height());
-            app.set_sx(sx);
-            app.set_sy(sy);
-            app.set_sw(sw);
-            app.set_sh(sh);
+            let region = hover_cursor.borrow_mut().hover(&hover_detector, x, y);
+            set_selection(&app, &hover_detector, region);
+        });
+        let weak = app.as_weak();
+        app.on_cycle_selection(move |x, y, direction| {
+            let Some(app) = weak.upgrade() else { return };
+            let region = cursor.borrow_mut().step(&detector, x, y, direction);
+            set_selection(&app, &detector, region);
         });
     }
 
@@ -330,6 +342,15 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
     }
 
     app.run().map_err(|error| error.to_string())
+}
+
+// 候选切换只写回归一化坐标，界面不需要了解检测来源和评分。
+fn set_selection(app: &AppWindow, detector: &RegionDetector, rect: babry::core::RectPx) {
+    let (sx, sy, sw, sh) = rect.to_normalized(detector.image_width(), detector.image_height());
+    app.set_sx(sx);
+    app.set_sy(sy);
+    app.set_sw(sw);
+    app.set_sh(sh);
 }
 
 fn make_export_action(
