@@ -33,6 +33,20 @@ use std::{
 
 const LEFT_BUTTON: u32 = 0x110;
 const RIGHT_BUTTON: u32 = 0x111;
+const MIN_PIN_SIZE: u32 = 64;
+const RESIZE_EDGE_DISTANCE: f64 = 14.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
 
 #[derive(Clone, Copy)]
 struct OutputMetrics {
@@ -80,6 +94,7 @@ pub fn run_surface(path: &Path) -> Result<(), String> {
     }
 
     let metrics = focused_output_metrics();
+    // 默认使用截图在当前输出上的完整逻辑尺寸，只在超出输出时等比缩小。
     let (base_width, base_height) = fitted_size(&source, metrics);
     let display = imageops::resize(
         &source,
@@ -87,8 +102,8 @@ pub fn run_surface(path: &Path) -> Result<(), String> {
         base_height,
         imageops::FilterType::Lanczos3,
     );
-    let x = ((metrics.width - base_width) / 2) as i32;
-    let y = ((metrics.height - base_height) / 2) as i32;
+    let x = ((metrics.width.saturating_sub(base_width)) / 2) as i32;
+    let y = ((metrics.height.saturating_sub(base_height)) / 2) as i32;
 
     let connection =
         Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
@@ -132,6 +147,7 @@ pub fn run_surface(path: &Path) -> Result<(), String> {
         x,
         y,
         dragging: false,
+        resizing: None,
         last_pointer: None,
         first_configure: true,
         pending_redraw: true,
@@ -166,6 +182,7 @@ struct PinSurface {
     x: i32,
     y: i32,
     dragging: bool,
+    resizing: Option<ResizeEdge>,
     last_pointer: Option<(f64, f64)>,
     first_configure: bool,
     pending_redraw: bool,
@@ -215,6 +232,86 @@ impl PinSurface {
         self.x = (self.x + dx.round() as i32).clamp(0, max_x);
         self.y = (self.y + dy.round() as i32).clamp(0, max_y);
         self.layer.set_margin(self.y, 0, 0, self.x);
+        self.layer.commit();
+    }
+
+    fn resize_edge_at(&self, position: (f64, f64)) -> Option<ResizeEdge> {
+        resize_edge_at(position, self.display.width(), self.display.height())
+    }
+}
+
+fn resize_edge_at(position: (f64, f64), width_px: u32, height_px: u32) -> Option<ResizeEdge> {
+    let width = width_px as f64;
+    let height = height_px as f64;
+    let left = position.0 <= RESIZE_EDGE_DISTANCE;
+    let right = position.0 >= width - RESIZE_EDGE_DISTANCE;
+    let top = position.1 <= RESIZE_EDGE_DISTANCE;
+    let bottom = position.1 >= height - RESIZE_EDGE_DISTANCE;
+    match (left, right, top, bottom) {
+        (true, false, true, false) => Some(ResizeEdge::TopLeft),
+        (false, true, true, false) => Some(ResizeEdge::TopRight),
+        (true, false, false, true) => Some(ResizeEdge::BottomLeft),
+        (false, true, false, true) => Some(ResizeEdge::BottomRight),
+        (true, false, false, false) => Some(ResizeEdge::Left),
+        (false, true, false, false) => Some(ResizeEdge::Right),
+        (false, false, true, false) => Some(ResizeEdge::Top),
+        (false, false, false, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+impl PinSurface {
+    fn resize_by(&mut self, edge: ResizeEdge, dx: f64, dy: f64) {
+        let old_width = self.display.width() as f64;
+        let old_height = self.display.height() as f64;
+        let (mut left, mut top, mut right, mut bottom) = (
+            self.x as f64,
+            self.y as f64,
+            self.x as f64 + old_width,
+            self.y as f64 + old_height,
+        );
+        match edge {
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => left += dx,
+            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => right += dx,
+            _ => {}
+        }
+        match edge {
+            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => top += dy,
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => bottom += dy,
+            _ => {}
+        }
+        let min = MIN_PIN_SIZE as f64;
+        if right - left < min {
+            if matches!(
+                edge,
+                ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
+            ) {
+                left = right - min;
+            } else {
+                right = left + min;
+            }
+        }
+        if bottom - top < min {
+            if matches!(
+                edge,
+                ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight
+            ) {
+                top = bottom - min;
+            } else {
+                bottom = top + min;
+            }
+        }
+        let width = (right - left).round().max(min) as u32;
+        let height = (bottom - top).round().max(min) as u32;
+        let max_x = self.screen_width.saturating_sub(width) as i32;
+        let max_y = self.screen_height.saturating_sub(height) as i32;
+        self.x = (left.round() as i32).clamp(0, max_x);
+        self.y = (top.round() as i32).clamp(0, max_y);
+        self.display =
+            imageops::resize(&self.source, width, height, imageops::FilterType::Lanczos3);
+        self.layer.set_size(width, height);
+        self.layer.set_margin(self.y, 0, 0, self.x);
+        self.pending_redraw = true;
         self.layer.commit();
     }
 
@@ -294,8 +391,8 @@ fn focused_output_metrics() -> OutputMetrics {
 fn fitted_size(source: &RgbaImage, output: OutputMetrics) -> (u32, u32) {
     let natural_width = source.width() as f32 / output.scale;
     let natural_height = source.height() as f32 / output.scale;
-    let fit = (output.width as f32 * 0.8 / natural_width)
-        .min(output.height as f32 * 0.8 / natural_height)
+    let fit = (output.width as f32 / natural_width)
+        .min(output.height as f32 / natural_height)
         .min(1.0);
     (
         (natural_width * fit).round().max(1.0) as u32,
@@ -538,14 +635,21 @@ impl PointerHandler for PinSurface {
                 continue;
             }
             match event.kind {
-                PointerEventKind::Motion { .. } if self.dragging => {
+                PointerEventKind::Motion { .. } if self.dragging || self.resizing.is_some() => {
                     if let Some(last) = self.last_pointer {
-                        self.move_by(event.position.0 - last.0, event.position.1 - last.1);
+                        let dx = event.position.0 - last.0;
+                        let dy = event.position.1 - last.1;
+                        if let Some(edge) = self.resizing {
+                            self.resize_by(edge, dx, dy);
+                        } else {
+                            self.move_by(dx, dy);
+                        }
                     }
                     self.last_pointer = Some(event.position);
                 }
                 PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
-                    self.dragging = true;
+                    self.resizing = self.resize_edge_at(event.position);
+                    self.dragging = self.resizing.is_none();
                     self.last_pointer = Some(event.position);
                 }
                 PointerEventKind::Press { button, .. } if button == RIGHT_BUTTON => {
@@ -553,6 +657,7 @@ impl PointerHandler for PinSurface {
                 }
                 PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
                     self.dragging = false;
+                    self.resizing = None;
                     self.last_pointer = None;
                 }
                 PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
@@ -600,6 +705,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resize_edge_detection_distinguishes_corners() {
+        assert_eq!(
+            resize_edge_at((2.0, 2.0), 400, 300),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(resize_edge_at((200.0, 150.0), 400, 300), None);
+    }
+
+    #[test]
     fn fits_physical_image_to_logical_output() {
         let image = RgbaImage::new(2560, 1440);
         let size = fitted_size(
@@ -610,6 +724,6 @@ mod tests {
                 scale: 1.25,
             },
         );
-        assert_eq!(size, (1638, 922));
+        assert_eq!(size, (2048, 1152));
     }
 }
