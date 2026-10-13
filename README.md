@@ -42,7 +42,7 @@
 - 在同一个界面完成标注、文字、复制、保存和贴图。
 
 > [!NOTE]
-> Babry 当前优先适配 Linux Wayland / niri。CV 选区使用 Rust 的 `imageproc` 内置实现，不依赖 `slurp`、niri 选区 IPC 或系统 OpenCV 动态库。
+> Babry 当前支持 Linux Wayland 下的 niri 和 Hyprland。CV 选区使用 Rust 的 `imageproc` 内置实现，不依赖 `slurp`、选区 IPC 或系统 OpenCV 动态库。
 
 ## 预览
 
@@ -138,6 +138,8 @@ babry                  # CV 智能区域截图：悬停吸附，单击确认
 babry --smart          # 同上，显式使用智能选区
 babry --screen         # 截取全屏并直接进入编辑
 babry --pin image.png  # 将已有 PNG 作为屏幕贴图
+babry --output DP-1 --screen # 指定显示器截图
+babry --list-outputs   # 列出 niri/Hyprland 显示器信息
 babry --help           # 查看完整帮助
 ```
 
@@ -173,6 +175,20 @@ CV 分析在每次截图时由后台线程执行一次，悬停不会重新处�
 - 滚轮：缩放贴图
 - 右键：关闭贴图
 - `Esc`：关闭获得焦点的贴图
+
+## 合成器与多显示器
+
+Babry 会根据 `XDG_CURRENT_DESKTOP` 选择 niri 或 Hyprland 的 IPC，读取每个显示器的名称、逻辑位置、逻辑尺寸和缩放比例。
+
+```bash
+babry --list-outputs
+babry --output DP-1 --screen
+babry --output DP-1 --pin image.png
+```
+
+`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。未指定显示器时使用合成器标记的焦点显示器，niri 没有焦点标记时使用第一个启用的显示器。
+
+当前截图按指定显示器单独捕获，贴图初始尺寸也按目标显示器的逻辑尺寸和缩放计算。跨显示器拖动、把同一张贴图动态迁移到另一块输出，以及不同输出间的实时 layer-shell 重绑定仍在完善中。
 
 ## niri 配置
 

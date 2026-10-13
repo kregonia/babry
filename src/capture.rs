@@ -3,9 +3,13 @@ use std::{
     process::{Command, Stdio},
 };
 
-pub fn capture(path: &Path) -> Result<(), String> {
-    let status = Command::new("grim")
-        .args(["-t", "png"])
+pub fn capture(path: &Path, output: Option<&str>) -> Result<(), String> {
+    let mut command = Command::new("grim");
+    command.args(["-t", "png"]);
+    if let Some(output) = output {
+        command.args(["-o", output]);
+    }
+    let status = command
         .arg(path)
         .status()
         .map_err(|e| format!("无法启动 grim: {e}"))?;

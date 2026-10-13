@@ -8,13 +8,37 @@ pub enum Command {
     PinSurface(PathBuf),
     DebugSelection { source: PathBuf, directory: PathBuf },
     Help,
+    OnOutput { command: Box<Command>, name: String },
+    ListOutputs,
 }
 
 pub fn parse<I>(args: I) -> Result<Command, String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut args = args.into_iter();
+    let mut values: Vec<String> = args.into_iter().collect();
+    if let Some(index) = values.iter().position(|arg| arg == "--output") {
+        if index + 1 >= values.len() {
+            return Err("--output 需要显示器名称".into());
+        }
+        let name = values.remove(index + 1);
+        values.remove(index);
+        if name.is_empty() || name.starts_with("--") || values.iter().any(|arg| arg == "--output") {
+            return Err("--output 需要唯一且有效的显示器名称".into());
+        }
+        let command = parse(values)?;
+        if !matches!(
+            command,
+            Command::Region | Command::Screen | Command::Pin(_) | Command::PinSurface(_)
+        ) {
+            return Err("--output 仅用于截图或贴图".into());
+        }
+        return Ok(Command::OnOutput {
+            command: Box::new(command),
+            name,
+        });
+    }
+    let mut args = values.into_iter();
     let _program = args.next();
     let Some(command) = args.next() else {
         return Ok(Command::Region);
@@ -50,6 +74,7 @@ where
                 },
             )
         }
+        "--list-outputs" => ensure_no_extra(args, Command::ListOutputs),
         "--help" | "-h" => ensure_no_extra(args, Command::Help),
         unknown => Err(format!("未知参数: {unknown}\n\n{}", usage())),
     }
@@ -67,7 +92,7 @@ where
 }
 
 pub fn usage() -> &'static str {
-    "用法:\n  babry                    CV 智能区域截图\n  babry --region           CV 智能区域截图\n  babry --smart            CV 智能区域截图\n  babry --screen           全屏截图后进入编辑\n  babry --pin PATH         将 PNG 作为屏幕贴图显示\n  babry --debug-selection IMAGE DIR\n                           输出 CV 候选图和评分 JSON\n  babry --help             显示帮助"
+    "用法:\n  babry                    CV 智能区域截图\n  babry --region           CV 智能区域截图\n  babry --smart            CV 智能区域截图\n  babry --screen           全屏截图后进入编辑\n  babry --pin PATH         将 PNG 作为屏幕贴图显示\n  babry --debug-selection IMAGE DIR\n                           输出 CV 候选图和评分 JSON\n  babry --output NAME      在指定显示器截图（可与 --screen 或 --pin 组合）\n  babry --list-outputs     列出显示器及逻辑尺寸、位置、缩放\n  babry --help             显示帮助"
 }
 
 #[cfg(test)]
@@ -76,6 +101,25 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> Result<Command, String> {
         parse(args.iter().map(|arg| (*arg).to_string()))
+    }
+
+    #[test]
+    fn parses_output_before_or_after_capture_mode() {
+        for args in [
+            vec!["babry", "--output", "DP-1", "--screen"],
+            vec!["babry", "--screen", "--output", "DP-1"],
+        ] {
+            assert_eq!(
+                parse_args(&args),
+                Ok(Command::OnOutput {
+                    command: Box::new(Command::Screen),
+                    name: "DP-1".into()
+                })
+            );
+        }
+        assert!(parse_args(&["babry", "--output"]).is_err());
+        assert!(parse_args(&["babry", "--output", "DP-1", "--output", "DP-2"]).is_err());
+        assert!(parse_args(&["babry", "--list-outputs", "--output", "DP-1"]).is_err());
     }
 
     #[test]

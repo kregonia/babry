@@ -49,24 +49,46 @@ fn dispatch() -> Result<(), String> {
             println!("{}", cli::usage());
             Ok(())
         }
-        cli::Command::Region => run_capture(false),
-        cli::Command::Screen => run_capture(true),
-        cli::Command::Pin(path) => pin::launch(&path),
-        cli::Command::PinSurface(path) => pin::run_surface(&path),
+        cli::Command::Region => run_capture(false, None),
+        cli::Command::Screen => run_capture(true, None),
+        cli::Command::Pin(path) => pin::launch(&path, None),
+        cli::Command::PinSurface(path) => pin::run_surface(&path, None),
+        cli::Command::OnOutput { command, name } => match *command {
+            cli::Command::Region => run_capture(false, Some(name)),
+            cli::Command::Screen => run_capture(true, Some(name)),
+            cli::Command::Pin(path) => pin::launch(&path, Some(name)),
+            cli::Command::PinSurface(path) => pin::run_surface(&path, Some(name)),
+            _ => unreachable!(),
+        },
+        cli::Command::ListOutputs => {
+            for output in babry::compositor::outputs()? {
+                println!(
+                    "{}: {}x{} at ({}, {}) scale {}{}",
+                    output.name,
+                    output.width,
+                    output.height,
+                    output.x,
+                    output.y,
+                    output.scale,
+                    if output.focused { " [focused]" } else { "" }
+                );
+            }
+            Ok(())
+        }
         cli::Command::DebugSelection { source, directory } => {
             selection::write_diagnostics(&source, &directory)
         }
     }
 }
 
-fn run_capture(direct_edit: bool) -> Result<(), String> {
+fn run_capture(direct_edit: bool, output: Option<String>) -> Result<(), String> {
     let temp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
         .map_err(|error| error.to_string())?;
     let source = temp.path().to_path_buf();
 
-    capture::capture(&source)?;
+    capture::capture(&source, output.as_deref())?;
     run_editor(source, direct_edit)
 }
 
@@ -430,7 +452,7 @@ fn make_pin_action(
         let selection = (app.get_sx(), app.get_sy(), app.get_sw(), app.get_sh());
         let marks = committed.borrow();
         match editor::export(&source, &output, selection, marks.entries()) {
-            Ok(()) => match pin::launch(&output) {
+            Ok(()) => match pin::launch(&output, None) {
                 Ok(()) => {
                     capture::notify("截图已贴到屏幕");
                     eprintln!("已贴图: {}", output.display());

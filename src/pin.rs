@@ -1,3 +1,4 @@
+use crate::compositor;
 use image::{RgbaImage, imageops};
 use smithay_client_toolkit::reexports::client::{
     Connection, QueueHandle,
@@ -56,23 +57,23 @@ struct OutputMetrics {
 }
 
 /// Start an independent process so the pin outlives the editor window.
-pub fn launch(path: &Path) -> Result<(), String> {
+pub fn launch(path: &Path, output: Option<String>) -> Result<(), String> {
     if !path.is_file() {
         return Err(format!("贴图文件不存在: {}", path.display()));
     }
 
     let current = std::env::current_exe().map_err(|error| error.to_string())?;
     let sibling = current.with_file_name("babry-pin");
+    let mut args = vec![path.to_string_lossy().into_owned()];
+    if let Some(output) = output {
+        args.extend(["--output".to_string(), output]);
+    }
     let (program, args): (PathBuf, Vec<String>) = if sibling.is_file() {
-        (sibling, vec![path.to_string_lossy().into_owned()])
+        (sibling, args)
     } else {
-        (
-            current,
-            vec![
-                "--pin-surface".to_string(),
-                path.to_string_lossy().into_owned(),
-            ],
-        )
+        let mut full = vec!["--pin-surface".to_string()];
+        full.extend(args);
+        (current, full)
     };
 
     Command::new(&program)
@@ -85,7 +86,7 @@ pub fn launch(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("无法启动贴图窗口 {}: {error}", program.display()))
 }
 
-pub fn run_surface(path: &Path) -> Result<(), String> {
+pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), String> {
     let source = image::open(path)
         .map_err(|error| format!("无法读取贴图 {}: {error}", path.display()))?
         .to_rgba8();
@@ -93,7 +94,7 @@ pub fn run_surface(path: &Path) -> Result<(), String> {
         return Err("贴图尺寸为空".to_string());
     }
 
-    let metrics = focused_output_metrics();
+    let metrics = focused_output_metrics(output_name.as_deref());
     // 默认使用截图在当前输出上的完整逻辑尺寸，只在超出输出时等比缩小。
     let (base_width, base_height) = fitted_size(&source, metrics);
     let display = imageops::resize(
@@ -346,45 +347,22 @@ impl PinSurface {
     }
 }
 
-fn focused_output_metrics() -> OutputMetrics {
+fn focused_output_metrics(name: Option<&str>) -> OutputMetrics {
     let fallback = OutputMetrics {
         width: 1920,
         height: 1080,
         scale: 1.0,
     };
-    let Ok(output) = Command::new("niri")
-        .args(["msg", "-j", "focused-output"])
-        .output()
-    else {
+    let Ok(outputs) = compositor::outputs() else {
         return fallback;
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+    let Ok(output) = compositor::select_output(&outputs, name) else {
         return fallback;
     };
-    let Some(logical) = value.get("logical") else {
-        return fallback;
-    };
-    let width = logical
-        .get("width")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok());
-    let height = logical
-        .get("height")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok());
-    let scale = logical
-        .get("scale")
-        .and_then(serde_json::Value::as_f64)
-        .map(|value| value as f32);
-    match (width, height, scale) {
-        (Some(width), Some(height), Some(scale)) if width > 0 && height > 0 && scale > 0.0 => {
-            OutputMetrics {
-                width,
-                height,
-                scale,
-            }
-        }
-        _ => fallback,
+    OutputMetrics {
+        width: output.width,
+        height: output.height,
+        scale: output.scale,
     }
 }
 
