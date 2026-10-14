@@ -82,17 +82,20 @@ fn dispatch() -> Result<(), String> {
 }
 
 fn run_capture(direct_edit: bool, output: Option<String>) -> Result<(), String> {
+    // 在编辑器抢占焦点之前确定输出，默认启动也必须只捕获这一块屏幕。
+    let outputs = babry::compositor::outputs()?;
+    let selected = babry::compositor::select_output(&outputs, output.as_deref())?;
     let temp = tempfile::Builder::new()
         .suffix(".png")
         .tempfile()
         .map_err(|error| error.to_string())?;
     let source = temp.path().to_path_buf();
 
-    capture::capture(&source, output.as_deref())?;
-    run_editor(source, direct_edit)
+    capture::capture(&source, &selected.name)?;
+    run_editor(source, direct_edit, selected.name)
 }
 
-fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
+fn run_editor(source: PathBuf, direct_edit: bool, output_name: String) -> Result<(), String> {
     let base = image::open(&source)
         .map_err(|error| error.to_string())?
         .to_rgba8();
@@ -351,7 +354,7 @@ fn run_editor(source: PathBuf, direct_edit: bool) -> Result<(), String> {
 
     let save_action = make_export_action(&app, &source, &committed, base_image.clone(), false);
     let copy_action = make_export_action(&app, &source, &committed, base_image.clone(), true);
-    let pin_action = make_pin_action(&app, &source, &committed, base_image);
+    let pin_action = make_pin_action(&app, &source, &committed, base_image, output_name);
 
     app.on_save(save_action);
     app.on_copy(copy_action);
@@ -442,6 +445,7 @@ fn make_pin_action(
     source: &Path,
     committed: &SharedMarks,
     _base: Arc<RgbaImage>,
+    output_name: String,
 ) -> impl Fn() + 'static {
     let weak = app.as_weak();
     let source = source.to_path_buf();
@@ -452,7 +456,7 @@ fn make_pin_action(
         let selection = (app.get_sx(), app.get_sy(), app.get_sw(), app.get_sh());
         let marks = committed.borrow();
         match editor::export(&source, &output, selection, marks.entries()) {
-            Ok(()) => match pin::launch(&output, None) {
+            Ok(()) => match pin::launch(&output, Some(output_name.clone())) {
                 Ok(()) => {
                     capture::notify("截图已贴到屏幕");
                     eprintln!("已贴图: {}", output.display());

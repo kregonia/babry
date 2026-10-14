@@ -186,7 +186,7 @@ babry --output DP-1 --screen
 babry --output DP-1 --pin image.png
 ```
 
-`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。未指定显示器时使用合成器标记的焦点显示器，niri 没有焦点标记时使用第一个启用的显示器。
+`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。默认启动会先通过 IPC 确定焦点显示器，再调用 `grim -o NAME` 只截取该屏幕；niri 通过 `focused-output` 查询焦点。无法获取焦点时使用第一个启用的显示器，IPC 查询失败则报告错误。指定不存在的显示器会报错。
 
 当前截图按指定显示器单独捕获，贴图初始尺寸也按目标显示器的逻辑尺寸和缩放计算。跨显示器拖动、把同一张贴图动态迁移到另一块输出，以及不同输出间的实时 layer-shell 重绑定仍在完善中。
 
