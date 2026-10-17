@@ -101,7 +101,7 @@ export component EditorToolbar inherits Rectangle {
     in-out property <int> effect-strength: 8;
     in property <int> next-number: 1;
     callback activate(int);
-    callback menu-request(int, length, length); // 1：形状，2：效果。
+    callback menu-request(int, length, length); // 1：形状，2：效果，3：颜色。
     callback color-changed();
     callback text-style-changed();
     callback undo();
@@ -249,6 +249,21 @@ export component EditorToolbar inherits Rectangle {
             }
             Text { text: "px"; color: #75869f; font-size: 11px; width: 17px; vertical-alignment: center; }
             Separator { }
+            Rectangle {
+                width: 24px;
+                height: 28px;
+                border-radius: 6px;
+                background: palette-area.has-hover ? #ffffff12 : transparent;
+                accessible-role: button;
+                accessible-label: "打开色盘";
+                // 彩虹保留原色，不使用工具图标的单色着色。
+                Image { x: 2px; y: 4px; width: 20px; height: 20px; source: @image-url("static/rainbow.svg"); }
+                palette-area := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.menu-request(3, self.absolute-position.x, self.absolute-position.y); }
+                }
+                Tooltip { text: @markdown("更多颜色"); }
+            }
             for color in [#ff3b30, #ffd60a, #0a84ff, #34c759, #ffffff]: ColorDot {
                 swatch: color;
                 selected-color: root.active-color;

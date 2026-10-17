@@ -364,6 +364,148 @@ fn toolbar_menus_dragging_numbering_and_numeric_width_work_through_pointer_event
 }
 
 #[test]
+fn rainbow_palette_updates_drawing_and_pending_text_without_changing_tools() {
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();
+    let app = AppWindow::new().unwrap();
+    let source = Arc::new(RgbaImage::from_pixel(1000, 700, Rgba([20, 30, 40, 255])));
+    let controller = EditorController::install(&app, source.clone());
+    app.set_screenshot(image_to_slint(&source));
+    app.set_sx(0.1);
+    app.set_sy(0.1);
+    app.set_sw(0.6);
+    app.set_sh(0.4);
+    app.set_phase(2);
+    app.invoke_editing_started();
+    app.show().unwrap();
+    window.set_size(PhysicalSize::new(1000, 700));
+
+    click(
+        &app,
+        app.get_toolbar_x() + 104.0,
+        app.get_toolbar_y() + 25.0,
+    );
+    assert_eq!(app.get_tool(), 1);
+    click(
+        &app,
+        app.get_toolbar_x() + 295.0,
+        app.get_toolbar_y() + 68.0,
+    );
+    assert_eq!(
+        app.get_open_menu(),
+        3,
+        "rainbow dot did not open the palette"
+    );
+    render_review(&window, &app, "toolbar-color-palette");
+    assert!(controller.document.borrow().marks().is_empty());
+    // 第一行的紫色是原工具栏未提供的默认颜色。
+    click(&app, app.get_menu_x() + 230.0, app.get_menu_y() + 48.0);
+    let purple = slint::Color::from_rgb_u8(175, 82, 222);
+    assert_eq!(app.get_active_color(), purple);
+    assert_eq!(app.get_open_menu(), 0);
+    assert_eq!(app.get_tool(), 1);
+    let start = LogicalPosition::new(250.0, 140.0);
+    let end = LogicalPosition::new(400.0, 170.0);
+    app.window().dispatch_event(WindowEvent::PointerPressed {
+        position: start,
+        button: PointerEventButton::Left,
+    });
+    move_pointer(&app, end.x, end.y);
+    app.window().dispatch_event(WindowEvent::PointerReleased {
+        position: end,
+        button: PointerEventButton::Left,
+    });
+    assert_eq!(
+        controller.document.borrow().marks()[0].color,
+        Rgba([175, 82, 222, 255])
+    );
+
+    // 色盘留白不关闭；点击外部只关闭色盘，不触发画布绘制。
+    click(
+        &app,
+        app.get_toolbar_x() + 295.0,
+        app.get_toolbar_y() + 68.0,
+    );
+    click(&app, app.get_menu_x() + 5.0, app.get_menu_y() + 166.0);
+    assert_eq!(app.get_open_menu(), 3);
+    click(&app, 800.0, 100.0);
+    assert_eq!(app.get_open_menu(), 0);
+    assert_eq!(controller.document.borrow().marks().len(), 1);
+
+    click(
+        &app,
+        app.get_toolbar_x() + 140.0,
+        app.get_toolbar_y() + 25.0,
+    );
+    click(&app, 300.0, 220.0);
+    for character in ["H", "i"] {
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: character.into(),
+        });
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: character.into(),
+        });
+    }
+    assert_eq!(app.get_text_value(), "Hi");
+    assert_eq!(
+        controller
+            .document
+            .borrow_mut()
+            .pending_mut()
+            .unwrap()
+            .color,
+        Rgba([175, 82, 222, 255])
+    );
+    click(
+        &app,
+        app.get_toolbar_x() + 295.0,
+        app.get_toolbar_y() + 68.0,
+    );
+    click(&app, app.get_menu_x() + 20.0, app.get_menu_y() + 82.0);
+    assert_eq!(
+        app.get_active_color(),
+        slint::Color::from_rgb_u8(255, 255, 255)
+    );
+    assert_eq!(app.get_tool(), 10);
+    assert_eq!(app.get_text_value(), "Hi");
+    assert_eq!(
+        controller.document.borrow().marks().len(),
+        1,
+        "changing color committed pending text"
+    );
+    assert_eq!(
+        controller
+            .document
+            .borrow_mut()
+            .pending_mut()
+            .unwrap()
+            .color,
+        Rgba([255, 255, 255, 255])
+    );
+    // 文字输入有焦点时，Esc 先关闭色盘，保留未提交文字。
+    click(
+        &app,
+        app.get_toolbar_x() + 295.0,
+        app.get_toolbar_y() + 68.0,
+    );
+    app.window().dispatch_event(WindowEvent::KeyPressed {
+        text: slint::platform::Key::Escape.into(),
+    });
+    app.window().dispatch_event(WindowEvent::KeyReleased {
+        text: slint::platform::Key::Escape.into(),
+    });
+    assert_eq!(app.get_open_menu(), 0);
+    assert_eq!(app.get_text_value(), "Hi");
+    assert_eq!(app.get_tool(), 10);
+    app.invoke_commit_text("Hi".into());
+    assert_eq!(
+        controller.document.borrow().marks().last().unwrap().color,
+        Rgba([255, 255, 255, 255])
+    );
+    app.hide().unwrap();
+}
+
+#[test]
 fn all_selection_edges_and_corners_resize() {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();

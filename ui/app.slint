@@ -1,5 +1,6 @@
 // 截图编辑界面：负责选区交互、工具栏和文字输入，图像检测与标注渲染通过回调交给 Rust。
 import { EditorToolbar, ToolMenuItem } from "toolbar.slint";
+import { ColorPalette } from "color-palette.slint";
 
 // 导出给 Rust 控制器的主窗口，统一管理选区阶段与标注阶段。
 export component AppWindow inherits Window {
@@ -50,10 +51,13 @@ export component AppWindow inherits Window {
     out property <length> toolbar-height: root.tool == 0 ? 50px : root.tool == 8 && root.effect-mode == 1 ? 136px : 98px;
     out property <length> toolbar-x: clamp(root.toolbar-positioned ? root.toolbar-manual-x : root.sx * root.width, 0px, max(0px, root.width - root.toolbar-width));
     out property <length> toolbar-y: clamp(root.toolbar-positioned ? root.toolbar-manual-y : (root.sy + root.sh) * root.height + 12px, 0px, max(0px, root.height - root.toolbar-height - 8px));
-    in-out property <int> open-menu: 0; // 1 形状、2 效果；窗口浮层不受工具栏横向滚动裁剪。
+    in-out property <int> open-menu: 0; // 1 形状、2 效果、3 颜色；浮层不受工具栏横向滚动裁剪。
     property <length> menu-anchor-x;
     property <length> menu-anchor-y;
-    property <length> menu-height: root.open-menu == 1 ? 122px : 86px;
+    property <length> menu-height: root.open-menu == 3 ? 174px : root.open-menu == 1 ? 122px : 86px;
+    property <length> menu-width: root.open-menu == 3 ? 278px : 160px;
+    out property <length> menu-x: clamp(root.menu-anchor-x - 34px, 8px, max(8px, root.width - root.menu-width - 8px));
+    out property <length> menu-y: clamp(root.menu-anchor-y >= root.menu-height + 8px ? root.menu-anchor-y - root.menu-height - 8px : root.menu-anchor-y + 42px, 8px, max(8px, root.height - root.menu-height - 8px));
 
     // 文字输入在确认前只更新预览，取消时丢弃待提交内容。
     property <bool> text-editing: false; // 是否显示文字输入框。
@@ -659,6 +663,10 @@ export component AppWindow inherits Window {
             selection-foreground-color: #ffffff;
             edited => { root.update-text(self.text); }
             key-pressed(event) => {
+                if (event.text == Key.Escape && root.open-menu != 0) {
+                    root.open-menu = 0;
+                    return accept;
+                }
                 if (event.text == Key.Escape) {
                     root.cancel-text();
                     root.text-editing = false;
@@ -765,10 +773,20 @@ export component AppWindow inherits Window {
             clicked => { root.open-menu = 0; }
             mouse-cursor: default;
         }
-        Rectangle {
-            x: clamp(root.menu-anchor-x - 34px, 8px, max(8px, root.width - 168px));
-            y: clamp(root.menu-anchor-y >= root.menu-height + 8px ? root.menu-anchor-y - root.menu-height - 8px : root.menu-anchor-y + 42px, 8px, max(8px, root.height - root.menu-height - 8px));
-            width: 160px;
+        if root.open-menu == 3: ColorPalette {
+            x: root.menu-x;
+            y: root.menu-y;
+            selected-color: root.active-color;
+            color-selected(color) => {
+                root.active-color = color;
+                root.update-text-style(color, round(root.text-font-size), max(0.001, root.sx + root.sw - root.text-x));
+                root.open-menu = 0;
+            }
+        }
+        if root.open-menu == 1 || root.open-menu == 2: Rectangle {
+            x: root.menu-x;
+            y: root.menu-y;
+            width: root.menu-width;
             height: root.menu-height;
             border-radius: 10px;
             background: #1d2737;
