@@ -1,0 +1,296 @@
+import { Slider } from "std-widgets.slint";
+
+// 工具栏采用同一套圆角、边框、选中态和键盘可访问说明。
+component ToolButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> description;
+    in property <bool> selected: false;
+    in property <bool> destructive: false;
+    callback clicked();
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: root.selected ? #c4b5fd88 : area.has-hover ? #ffffff20 : transparent;
+    background: root.selected ? @linear-gradient(135deg, #7355ae, #436bb0)
+        : area.pressed ? #ffffff24 : area.has-hover ? #ffffff12 : transparent;
+    animate background, border-color { duration: 100ms; }
+    accessible-role: button;
+    accessible-label: root.description;
+    Image {
+        width: 18px;
+        height: 18px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon;
+        colorize: root.destructive ? #ff9999 : root.selected || area.has-hover ? white : #c9d4e3;
+    }
+    area := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    Tooltip { text: @markdown("\{root.description}"); }
+}
+
+component Separator inherits Rectangle {
+    width: 9px;
+    height: 22px;
+    Rectangle { x: 4px; width: 1px; height: 100%; background: #ffffff1a; }
+}
+
+component ColorDot inherits Rectangle {
+    in property <color> swatch;
+    in property <color> selected-color;
+    callback clicked();
+    width: 24px;
+    height: 28px;
+    Rectangle {
+        width: 15px;
+        height: 15px;
+        x: 4px;
+        y: 6px;
+        border-radius: 8px;
+        background: root.swatch;
+        border-width: 2px;
+        border-color: root.swatch == root.selected-color ? white : area.has-hover ? #a6c8ff : transparent;
+    }
+    area := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// 数值输入和滑块共享整数值；空输入允许继续编辑，失焦/回车时归一化并钳制范围。
+component NumberField inherits Rectangle {
+    in-out property <int> value: 4;
+    in property <int> minimum: 1;
+    in property <int> maximum: 64;
+    callback edited(int);
+    width: 48px;
+    height: 28px;
+    border-radius: 6px;
+    background: #111722;
+    border-width: 1px;
+    border-color: input.has-focus ? #9dbeff : #ffffff22;
+    changed value => { input.text = root.value; }
+    input := TextInput {
+        x: 5px;
+        width: parent.width - 10px;
+        height: parent.height;
+        text: root.value;
+        color: #eef3ff;
+        font-size: 12px;
+        single-line: true;
+        input-type: number;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        selection-background-color: #557bbf;
+        edited => {
+            if (self.text.is-float()) {
+                let next = clamp(round(self.text.to-float()), root.minimum, root.maximum);
+                root.value = next;
+                root.edited(next);
+            }
+        }
+        accepted => { self.text = root.value; }
+        changed has-focus => { if (!self.has-focus) { self.text = root.value; } }
+    }
+}
+
+export component EditorToolbar inherits Rectangle {
+    in property <int> tool: 0;
+    in property <int> shape-tool: 2;
+    in property <int> effect-mode: 0;
+    in-out property <color> active-color: #ff3b30;
+    in-out property <int> line-width: 4;
+    in-out property <float> text-font-size: 24;
+    in-out property <int> effect-strength: 8;
+    in property <int> next-number: 1;
+    callback activate(int);
+    callback menu-request(int, length, length); // 1：形状，2：效果。
+    callback color-changed();
+    callback text-style-changed();
+    callback undo();
+    callback redo();
+    callback save();
+    callback copy();
+    callback pin();
+    callback cancel();
+    callback drag-start(length, length);
+    callback drag-update(length, length);
+    callback drag-finish();
+
+    height: root.tool == 0 ? 50px : root.tool == 8 && root.effect-mode == 1 ? 136px : 98px;
+    border-radius: 13px;
+    border-width: 1px;
+    border-color: #ffffff28;
+    background: @linear-gradient(145deg, #273140f5, #121925f5);
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 5px;
+    drop-shadow-color: #00000070;
+    // 裁剪只应用于可横向滚动的行；下拉菜单由窗口上的独立浮层显示。
+    TouchArea { } // 阻止栏内留白穿透到选区。
+
+    // 拖动柄固定在可滚动区域外，小窗口下也不会被横向滚动手势抢走。
+    grip := Rectangle {
+        x: 8px;
+        y: 8px;
+        width: 26px;
+        height: 34px;
+        border-radius: 8px;
+        background: grip-area.has-hover ? #ffffff0d : transparent;
+        Image { source: @image-url("static/grip.svg"); colorize: grip-area.pressed ? white : #92a1b7; width: 17px; height: 21px; x: 4px; y: 6px; }
+        grip-area := TouchArea {
+            mouse-cursor: self.pressed ? grabbing : grab;
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                    root.drag-start(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y);
+                }
+                if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) { root.drag-finish(); }
+            }
+            moved => { root.drag-update(self.absolute-position.x + self.mouse-x, self.absolute-position.y + self.mouse-y); }
+        }
+        Tooltip { text: @markdown("按住鼠标左键并拖动工具栏"); }
+    }
+
+    row := Flickable {
+        x: 36px;
+        y: 8px;
+        width: max(1px, parent.width - 44px);
+        height: 34px;
+        viewport-width: 556px;
+        viewport-height: 34px;
+        interactive: self.viewport-width > self.width;
+        HorizontalLayout {
+            width: 556px;
+            height: 34px;
+            spacing: 2px;
+            Rectangle {
+                width: 50px;
+                ToolButton {
+                    icon: root.shape-tool == 14 ? @image-url("static/shape-circle.svg") : root.shape-tool == 13 ? @image-url("static/shape-square.svg") : @image-url("static/shape-rectangle.svg");
+                    description: "形状（再次点击取消选择）";
+                    selected: root.tool == root.shape-tool;
+                    clicked => { root.activate(root.shape-tool); }
+                }
+                shape-arrow := ToolButton {
+                    x: 34px;
+                    width: 16px;
+                    icon: @image-url("static/chevron.svg");
+                    description: "选择矩形、圆形或方形";
+                    clicked => { root.menu-request(1, self.absolute-position.x, self.absolute-position.y); }
+                }
+            }
+            ToolButton { icon: @image-url("static/pen.svg"); description: "画笔"; selected: root.tool == 1; clicked => { root.activate(1); } }
+            ToolButton { icon: @image-url("static/mark.svg"); description: "文字"; selected: root.tool == 10; clicked => { root.activate(10); } }
+            ToolButton { icon: @image-url("static/number.svg"); description: "数字标注"; selected: root.tool == 11; clicked => { root.activate(11); } }
+            Rectangle {
+                width: 50px;
+                ToolButton {
+                    icon: root.effect-mode == 0 ? @image-url("static/effects.svg") : @image-url("static/blur.svg");
+                    description: root.effect-mode == 0 ? "马赛克" : "高斯模糊";
+                    selected: root.tool == 8;
+                    clicked => { root.activate(8); }
+                }
+                ToolButton {
+                    x: 34px;
+                    width: 16px;
+                    icon: @image-url("static/chevron.svg");
+                    description: "选择马赛克或高斯模糊";
+                    clicked => { root.menu-request(2, self.absolute-position.x, self.absolute-position.y); }
+                }
+            }
+            ToolButton { icon: @image-url("static/eraser.svg"); description: "橡皮擦：还原原截图像素"; selected: root.tool == 12; clicked => { root.activate(12); } }
+            ToolButton { icon: @image-url("static/highlight.svg"); description: "荧光笔"; selected: root.tool == 7; clicked => { root.activate(7); } }
+            Separator { }
+            ToolButton { icon: @image-url("static/undo.svg"); description: "撤销 Ctrl+Z"; clicked => { root.undo(); } }
+            ToolButton { icon: @image-url("static/redo.svg"); description: "重做 Ctrl+Shift+Z"; clicked => { root.redo(); } }
+            Separator { }
+            ToolButton { icon: @image-url("static/pin.svg"); description: "Pin 贴图"; clicked => { root.pin(); } }
+            ToolButton { icon: @image-url("static/save.svg"); description: "保存到本地 Ctrl+S"; clicked => { root.save(); } }
+            ToolButton { icon: @image-url("static/cancle.svg"); description: "取消截图"; destructive: true; clicked => { root.cancel(); } }
+            ToolButton { icon: @image-url("static/copy.svg"); description: "复制 Ctrl+C"; clicked => { root.copy(); } }
+            ToolButton { icon: @image-url("static/more.svg"); description: "更多"; clicked => { } }
+        }
+    }
+
+    if root.tool != 0: Flickable {
+        x: 12px;
+        y: 54px;
+        width: max(1px, parent.width - 24px);
+        height: 32px;
+        viewport-width: 574px;
+        viewport-height: 32px;
+        interactive: self.viewport-width > self.width;
+        HorizontalLayout {
+            width: 574px;
+            height: 32px;
+            spacing: 7px;
+            Text { text: root.tool == 10 || root.tool == 11 ? "字号" : "粗细"; color: #aab9ce; font-size: 12px; width: 30px; vertical-alignment: center; }
+            if root.tool != 10 && root.tool != 11: Slider {
+                minimum: 1;
+                maximum: 64;
+                step: 1;
+                value: root.line-width;
+                width: 132px;
+                changed => { root.line-width = round(self.value); }
+            }
+            if root.tool == 10 || root.tool == 11: Slider {
+                minimum: 12;
+                maximum: 72;
+                step: 1;
+                value: root.text-font-size;
+                width: 132px;
+                changed => { root.text-font-size = round(self.value); root.text-style-changed(); }
+            }
+            if root.tool != 10 && root.tool != 11: NumberField {
+                value <=> root.line-width;
+                edited(value) => { root.line-width = value; }
+            }
+            if root.tool == 10 || root.tool == 11: NumberField {
+                value: round(root.text-font-size);
+                minimum: 12;
+                maximum: 72;
+                edited(value) => { root.text-font-size = value; root.text-style-changed(); }
+            }
+            Text { text: "px"; color: #75869f; font-size: 11px; width: 17px; vertical-alignment: center; }
+            Separator { }
+            for color in [#ff3b30, #ffd60a, #0a84ff, #34c759, #ffffff]: ColorDot {
+                swatch: color;
+                selected-color: root.active-color;
+                clicked => { root.active-color = color; root.color-changed(); }
+            }
+            Text {
+                text: root.tool == 11 ? "下一个：" + root.next-number
+                    : root.tool == 1 ? "画笔" : root.tool == 10 ? "文字" : root.tool == 12 ? "橡皮擦"
+                    : root.tool == 7 ? "荧光笔" : root.tool == 8 ? (root.effect-mode == 0 ? "马赛克" : "高斯模糊")
+                    : root.shape-tool == 14 ? "圆形" : root.shape-tool == 13 ? "方形" : "矩形";
+                color: #a7b9d3;
+                font-size: 11px;
+                horizontal-stretch: 1;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if root.tool == 8 && root.effect-mode == 1: HorizontalLayout {
+        x: 12px;
+        y: 96px;
+        width: parent.width - 24px;
+        height: 28px;
+        spacing: 8px;
+        Text { text: "模糊度"; color: #aab9ce; font-size: 12px; width: 45px; vertical-alignment: center; }
+        Slider { minimum: 1; maximum: 20; step: 1; value: root.effect-strength; changed => { root.effect-strength = round(self.value); } }
+        NumberField { minimum: 1; maximum: 20; value <=> root.effect-strength; }
+    }
+}
+
+export component ToolMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> selected: false;
+    callback clicked();
+    height: 36px;
+    border-radius: 6px;
+    background: item-area.has-hover ? #ffffff16 : root.selected ? #5367aa55 : transparent;
+    accessible-role: button;
+    accessible-label: root.label;
+    Image { x: 10px; y: 9px; width: 18px; height: 18px; source: root.icon; colorize: root.selected ? #b9cbff : #dce5f2; }
+    Text { x: 40px; color: #e4ecf9; font-size: 12px; height: 100%; vertical-alignment: center; text: root.label; }
+    item-area := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}

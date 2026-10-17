@@ -1,9 +1,12 @@
 use crate::compositor;
 use image::{RgbaImage, imageops};
 use smithay_client_toolkit::reexports::client::{
-    Connection, QueueHandle,
+    Connection, EventQueue, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+};
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::{
+    wp_viewport, wp_viewporter,
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -27,7 +30,6 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::{
-    convert::TryInto,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -87,9 +89,22 @@ pub fn launch(path: &Path, output: Option<String>) -> Result<(), String> {
 }
 
 pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), String> {
+    let (mut pin, mut event_queue) = create_pin(path, output_name)?;
+    while !pin.exit {
+        event_queue
+            .blocking_dispatch(&mut pin)
+            .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
+    }
+    Ok(())
+}
+
+fn create_pin(
+    path: &Path,
+    output_name: Option<String>,
+) -> Result<(PinSurface, EventQueue<PinSurface>), String> {
     let source = image::open(path)
         .map_err(|error| format!("无法读取贴图 {}: {error}", path.display()))?
-        .to_rgba8();
+        .into_rgba8();
     if source.width() == 0 || source.height() == 0 {
         return Err("贴图尺寸为空".to_string());
     }
@@ -97,18 +112,12 @@ pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), Strin
     let metrics = focused_output_metrics(output_name.as_deref());
     // 默认使用截图在当前输出上的完整逻辑尺寸，只在超出输出时等比缩小。
     let (base_width, base_height) = fitted_size(&source, metrics);
-    let display = imageops::resize(
-        &source,
-        base_width,
-        base_height,
-        imageops::FilterType::Lanczos3,
-    );
     let x = ((metrics.width.saturating_sub(base_width)) / 2) as i32;
     let y = ((metrics.height.saturating_sub(base_height)) / 2) as i32;
 
     let connection =
         Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
-    let (globals, mut event_queue) = registry_queue_init(&connection)
+    let (globals, event_queue) = registry_queue_init(&connection)
         .map_err(|error| format!("无法初始化 Wayland registry: {error}"))?;
     let qh = event_queue.handle();
     let compositor = CompositorState::bind(&globals, &qh)
@@ -118,6 +127,28 @@ pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), Strin
     let shm = Shm::bind(&globals, &qh).map_err(|error| format!("wl_shm 不可用: {error}"))?;
 
     let surface = compositor.create_surface(&qh);
+    let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+    let viewport = viewporter
+        .as_ref()
+        .map(|manager| manager.get_viewport(&surface, &qh, ()));
+    if let Some(viewport) = &viewport {
+        viewport.set_destination(base_width as i32, base_height as i32);
+    }
+    let display = if viewport.is_none() {
+        Some(imageops::resize(
+            &source,
+            base_width,
+            base_height,
+            imageops::FilterType::Lanczos3,
+        ))
+    } else {
+        None
+    };
+    let buffer_size = if viewport.is_some() {
+        source.dimensions()
+    } else {
+        (base_width, base_height)
+    };
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("babry-pin"), None);
     layer.set_anchor(Anchor::TOP | Anchor::LEFT);
     layer.set_size(base_width, base_height);
@@ -125,21 +156,24 @@ pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), Strin
     layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     layer.commit();
 
-    let initial_pool_size = (base_width as usize)
-        .saturating_mul(base_height as usize)
+    let initial_pool_size = (buffer_size.0 as usize)
+        .saturating_mul(buffer_size.1 as usize)
         .saturating_mul(4)
         .max(4);
     let pool = SlotPool::new(initial_pool_size, &shm)
         .map_err(|error| format!("无法创建贴图缓冲区: {error}"))?;
-    let mut pin = PinSurface {
+    let pin = PinSurface {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
         layer,
         pool,
-        source,
+        source: Some(source),
         display,
+        viewport,
+        _viewporter: viewporter,
+        display_size: (base_width, base_height),
         screen_width: metrics.width,
         screen_height: metrics.height,
         base_width,
@@ -158,12 +192,7 @@ pub fn run_surface(path: &Path, output_name: Option<String>) -> Result<(), Strin
         keyboard: None,
     };
 
-    while !pin.exit {
-        event_queue
-            .blocking_dispatch(&mut pin)
-            .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
-    }
-    Ok(())
+    Ok((pin, event_queue))
 }
 
 struct PinSurface {
@@ -173,8 +202,11 @@ struct PinSurface {
     shm: Shm,
     layer: LayerSurface,
     pool: SlotPool,
-    source: RgbaImage,
-    display: RgbaImage,
+    source: Option<RgbaImage>,
+    display: Option<RgbaImage>, // 仅合成器不支持 viewporter 时使用 CPU 回退。
+    viewport: Option<wp_viewport::WpViewport>,
+    _viewporter: Option<wp_viewporter::WpViewporter>,
+    display_size: (u32, u32),
     screen_width: u32,
     screen_height: u32,
     base_width: u32,
@@ -195,8 +227,16 @@ struct PinSurface {
 
 impl PinSurface {
     fn draw(&mut self) -> Result<(), String> {
-        let width = self.display.width();
-        let height = self.display.height();
+        // viewporter 路径的图像始终不变，只提交一次共享内存缓冲区。
+        if self.viewport.is_some() && self.buffer.is_some() {
+            return Ok(());
+        }
+        let image = if self.viewport.is_some() {
+            self.source.as_ref().unwrap()
+        } else {
+            self.display.as_ref().unwrap()
+        };
+        let (width, height) = image.dimensions();
         let stride = width
             .checked_mul(4)
             .ok_or_else(|| "贴图缓冲区行宽溢出".to_string())?;
@@ -210,9 +250,15 @@ impl PinSurface {
             )
             .map_err(|error| format!("无法创建贴图缓冲区: {error}"))?;
 
-        for (pixel, chunk) in self.display.pixels().zip(canvas.chunks_exact_mut(4)) {
-            let bytes: &mut [u8; 4] = chunk.try_into().expect("ARGB8888 chunk size");
-            *bytes = [pixel[2], pixel[1], pixel[0], pixel[3]];
+        for (pixel, chunk) in image.pixels().zip(canvas.chunks_exact_mut(4)) {
+            // Wayland ARGB8888 使用预乘 alpha；截图通常不透明，也支持透明 PNG。
+            let alpha = u16::from(pixel[3]);
+            chunk.copy_from_slice(&[
+                ((u16::from(pixel[2]) * alpha + 127) / 255) as u8,
+                ((u16::from(pixel[1]) * alpha + 127) / 255) as u8,
+                ((u16::from(pixel[0]) * alpha + 127) / 255) as u8,
+                pixel[3],
+            ]);
         }
 
         self.layer
@@ -222,14 +268,17 @@ impl PinSurface {
             .attach_to(self.layer.wl_surface())
             .map_err(|error| format!("无法提交贴图缓冲区: {error}"))?;
         self.buffer = Some(buffer);
+        if self.viewport.is_some() {
+            self.source = None;
+        }
         self.pending_redraw = false;
         self.layer.commit();
         Ok(())
     }
 
     fn move_by(&mut self, dx: f64, dy: f64) {
-        let max_x = self.screen_width.saturating_sub(self.display.width()) as i32;
-        let max_y = self.screen_height.saturating_sub(self.display.height()) as i32;
+        let max_x = self.screen_width.saturating_sub(self.display_size.0) as i32;
+        let max_y = self.screen_height.saturating_sub(self.display_size.1) as i32;
         self.x = (self.x + dx.round() as i32).clamp(0, max_x);
         self.y = (self.y + dy.round() as i32).clamp(0, max_y);
         self.layer.set_margin(self.y, 0, 0, self.x);
@@ -237,7 +286,7 @@ impl PinSurface {
     }
 
     fn resize_edge_at(&self, position: (f64, f64)) -> Option<ResizeEdge> {
-        resize_edge_at(position, self.display.width(), self.display.height())
+        resize_edge_at(position, self.display_size.0, self.display_size.1)
     }
 }
 
@@ -263,8 +312,8 @@ fn resize_edge_at(position: (f64, f64), width_px: u32, height_px: u32) -> Option
 
 impl PinSurface {
     fn resize_by(&mut self, edge: ResizeEdge, dx: f64, dy: f64) {
-        let old_width = self.display.width() as f64;
-        let old_height = self.display.height() as f64;
+        let old_width = self.display_size.0 as f64;
+        let old_height = self.display_size.1 as f64;
         let (mut left, mut top, mut right, mut bottom) = (
             self.x as f64,
             self.y as f64,
@@ -302,23 +351,35 @@ impl PinSurface {
                 bottom = top + min;
             }
         }
-        let width = (right - left).round().max(min) as u32;
-        let height = (bottom - top).round().max(min) as u32;
+        let width = ((right - left).round().max(min) as u32).min(self.screen_width);
+        let height = ((bottom - top).round().max(min) as u32).min(self.screen_height);
         let max_x = self.screen_width.saturating_sub(width) as i32;
         let max_y = self.screen_height.saturating_sub(height) as i32;
         self.x = (left.round() as i32).clamp(0, max_x);
         self.y = (top.round() as i32).clamp(0, max_y);
-        self.display =
-            imageops::resize(&self.source, width, height, imageops::FilterType::Lanczos3);
+        self.apply_size(width, height);
+    }
+
+    fn apply_size(&mut self, width: u32, height: u32) {
+        self.display_size = (width, height);
+        if let Some(viewport) = &self.viewport {
+            viewport.set_destination(width as i32, height as i32);
+        } else {
+            self.display = Some(imageops::resize(
+                self.source.as_ref().unwrap(),
+                width,
+                height,
+                imageops::FilterType::Lanczos3,
+            ));
+            self.pending_redraw = true;
+        }
         self.layer.set_size(width, height);
         self.layer.set_margin(self.y, 0, 0, self.x);
-        self.pending_redraw = true;
         self.layer.commit();
     }
 
     fn change_zoom(&mut self, factor: f32) {
-        let old_width = self.display.width();
-        let old_height = self.display.height();
+        let (old_width, old_height) = self.display_size;
         let center_x = self.x + old_width as i32 / 2;
         let center_y = self.y + old_height as i32 / 2;
 
@@ -332,20 +393,26 @@ impl PinSurface {
             return;
         }
 
-        self.display =
-            imageops::resize(&self.source, width, height, imageops::FilterType::Lanczos3);
         self.x = center_x - width as i32 / 2;
         self.y = center_y - height as i32 / 2;
         let max_x = self.screen_width.saturating_sub(width) as i32;
         let max_y = self.screen_height.saturating_sub(height) as i32;
         self.x = self.x.clamp(0, max_x);
         self.y = self.y.clamp(0, max_y);
-        self.layer.set_size(width, height);
-        self.layer.set_margin(self.y, 0, 0, self.x);
-        self.pending_redraw = true;
-        self.layer.commit();
+        self.apply_size(width, height);
     }
 }
+
+impl Drop for PinSurface {
+    fn drop(&mut self) {
+        if let Some(viewport) = &self.viewport {
+            viewport.destroy();
+        }
+    }
+}
+
+delegate_noop!(PinSurface: ignore wp_viewporter::WpViewporter);
+delegate_noop!(PinSurface: ignore wp_viewport::WpViewport);
 
 fn focused_output_metrics(name: Option<&str>) -> OutputMetrics {
     let fallback = OutputMetrics {
@@ -689,6 +756,38 @@ mod tests {
             Some(ResizeEdge::TopLeft)
         );
         assert_eq!(resize_edge_at((200.0, 150.0), 400, 300), None);
+    }
+
+    #[test]
+    #[ignore = "requires a live Wayland session with layer-shell and viewporter"]
+    fn viewport_resize_reuses_one_buffer_and_releases_source_pixels() {
+        use smithay_client_toolkit::reexports::client::Proxy;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pin.png");
+        RgbaImage::from_pixel(400, 300, image::Rgba([30, 120, 200, 255]))
+            .save(&path)
+            .unwrap();
+        let (mut pin, mut queue) = create_pin(&path, None).unwrap();
+        assert!(pin.viewport.is_some(), "live compositor has no viewporter");
+        for _ in 0..8 {
+            queue.roundtrip(&mut pin).unwrap();
+            if pin.buffer.is_some() {
+                break;
+            }
+        }
+        assert!(pin.buffer.is_some(), "surface was not configured");
+        let id = pin.buffer.as_ref().unwrap().wl_buffer().id();
+        assert!(pin.source.is_none());
+        assert!(pin.display.is_none());
+        for (width, height) in [(300, 200), (600, 450), (400, 300)] {
+            pin.apply_size(width, height);
+            queue.roundtrip(&mut pin).unwrap();
+            assert_eq!(pin.display_size, (width, height));
+            assert_eq!(pin.buffer.as_ref().unwrap().wl_buffer().id(), id);
+            assert!(!pin.pending_redraw);
+            assert!(pin.source.is_none());
+            assert!(pin.display.is_none());
+        }
     }
 
     #[test]

@@ -1,8 +1,9 @@
+use crate::core::RectPx;
 use ab_glyph::{Font, FontArc, FontVec, ScaleFont};
-use image::{DynamicImage, GenericImageView, Rgba, RgbaImage, imageops};
+use image::{Rgba, RgbaImage, imageops};
 use imageproc::drawing::{
-    draw_filled_circle_mut, draw_hollow_ellipse_mut, draw_hollow_rect_mut, draw_line_segment_mut,
-    draw_text_mut, text_size,
+    Canvas, draw_filled_circle_mut, draw_hollow_ellipse_mut, draw_hollow_rect_mut,
+    draw_line_segment_mut, draw_text_mut, text_size,
 };
 use imageproc::rect::Rect;
 use std::{
@@ -31,6 +32,7 @@ pub struct Mark {
     pub font_size: f32,  // 截图像素中的字号，与笔刷粗细独立。
     pub text_width: f32, // 文字输入区的最大宽度，用于保持换行位置一致。
     pub effect_strength: u32,
+    pub number: u32, // 数字标注的序号，随撤销/重做保留。
 }
 
 impl Mark {
@@ -42,14 +44,15 @@ impl Mark {
             x2,
             y2,
             color,
-            width: width.clamp(1, 20),
+            width: width.clamp(1, 64),
             points: Vec::new(),
             text: String::new(),
             font_size: 24.0,
             text_width: f32::INFINITY,
             effect_strength: 8,
+            number: 1,
         };
-        if matches!(kind, 1 | 7 | 8 | 9) {
+        if matches!(kind, 1 | 7 | 8 | 9 | 12) {
             mark.points.push(Point { x: x1, y: y1 });
         }
         mark
@@ -72,7 +75,7 @@ impl Mark {
     pub fn update_endpoint(&mut self, x: f32, y: f32) {
         self.x2 = x;
         self.y2 = y;
-        if matches!(self.kind, 1 | 7 | 8 | 9) {
+        if matches!(self.kind, 1 | 7 | 8 | 9 | 12) {
             let point = Point { x, y };
             let should_add = self.points.last().is_none_or(|last| {
                 let dx = point.x - last.x;
@@ -87,43 +90,44 @@ impl Mark {
 }
 
 pub fn export(
-    source: &Path,
+    source: &RgbaImage,
     output: &Path,
     selection: (f32, f32, f32, f32),
     marks: &[Mark],
 ) -> Result<(), String> {
-    let image = image::open(source).map_err(|e| e.to_string())?;
-    let (iw, ih) = image.dimensions();
-    let (sx, sy, sw, sh) = selection;
-    let px = (sx * iw as f32).round().clamp(0.0, iw as f32 - 1.0) as u32;
-    let py = (sy * ih as f32).round().clamp(0.0, ih as f32 - 1.0) as u32;
-    let pw = (sw * iw as f32).round().max(1.0).min((iw - px) as f32) as u32;
-    let ph = (sh * ih as f32).round().max(1.0).min((ih - py) as f32) as u32;
-    if marks.iter().any(|mark| {
-        mark.kind == 10 && !mark.text.trim().is_empty() && annotation_font(&mark.text).is_none()
-    }) {
-        return Err("无法加载文字标注字体，请设置 BABRY_FONT".to_string());
+    if source.width() == 0 || source.height() == 0 {
+        return Err("截图尺寸为空".into());
     }
-    let mut canvas = imageops::crop_imm(&image, px, py, pw, ph).to_image();
-
-    for mark in marks {
-        draw_mark(
-            &mut canvas,
-            mark,
-            iw as f32,
-            ih as f32,
-            px as f32,
-            py as f32,
-        );
-    }
-    DynamicImage::ImageRgba8(canvas)
+    let region = selection_rect(source, selection);
+    validate_fonts(marks)?;
+    render_region(source, region, marks)
         .save(output)
         .map_err(|e| e.to_string())
 }
 
+pub(crate) fn validate_fonts(marks: &[Mark]) -> Result<(), String> {
+    if marks.iter().any(|mark| {
+        (mark.kind == 10 && !mark.text.trim().is_empty() && annotation_font(&mark.text).is_none())
+            || (mark.kind == 11 && annotation_font("0123456789").is_none())
+    }) {
+        Err("无法加载文字标注字体，请设置 BABRY_FONT".into())
+    } else {
+        Ok(())
+    }
+}
+
 pub fn render_marks(mut image: RgbaImage, marks: &[Mark]) -> RgbaImage {
+    // 橡皮擦还原截图原像素，必须保留标注前的来源；普通绘制不创建这份副本。
+    let source = marks
+        .iter()
+        .any(|mark| mark.kind == 12)
+        .then(|| image.clone());
     for mark in marks {
-        render_mark_onto(&mut image, mark);
+        if let Some(source) = &source {
+            render_mark_in_region(&mut image, mark, source, (0, 0));
+        } else {
+            render_mark_onto(&mut image, mark);
+        }
     }
     image
 }
@@ -133,32 +137,158 @@ pub fn render_mark_onto(image: &mut RgbaImage, mark: &Mark) {
     draw_mark(image, mark, width as f32, height as f32, 0.0, 0.0);
 }
 
+/// 所有编辑与导出共用相同的裁剪取整规则。
+pub fn selection_rect(source: &RgbaImage, selection: (f32, f32, f32, f32)) -> RectPx {
+    let (iw, ih) = source.dimensions();
+    if iw == 0 || ih == 0 {
+        return RectPx::new(0, 0, 0, 0);
+    }
+    let (sx, sy, sw, sh) = selection;
+    let x = (sx * iw as f32).round().clamp(0.0, iw as f32 - 1.0) as u32;
+    let y = (sy * ih as f32).round().clamp(0.0, ih as f32 - 1.0) as u32;
+    let width = (sw * iw as f32).round().max(1.0).min((iw - x) as f32) as u32;
+    let height = (sh * ih as f32).round().max(1.0).min((ih - y) as f32) as u32;
+    RectPx::new(x as i32, y as i32, width, height)
+}
+
+pub fn render_region(source: &RgbaImage, region: RectPx, marks: &[Mark]) -> RgbaImage {
+    let mut canvas = imageops::crop_imm(
+        source,
+        region.x as u32,
+        region.y as u32,
+        region.width,
+        region.height,
+    )
+    .to_image();
+    for mark in marks {
+        render_mark_in_region(&mut canvas, mark, source, (region.x, region.y));
+    }
+    canvas
+}
+
+/// 标注位置始终相对原截图，局部画布只改变裁剪原点。
+pub fn render_mark_in_region(
+    canvas: &mut RgbaImage,
+    mark: &Mark,
+    source: &RgbaImage,
+    origin: (i32, i32),
+) {
+    if mark.kind == 12 {
+        erase_mark(canvas, mark, source, origin);
+    } else {
+        draw_mark(
+            canvas,
+            mark,
+            source.width() as f32,
+            source.height() as f32,
+            origin.0 as f32,
+            origin.1 as f32,
+        );
+    }
+}
+
+/// 保守包围盒包含笔宽、箭头、字形外伸和滤镜采样边距，用于恢复/上传局部预览。
+pub fn mark_bounds(mark: &Mark, image_size: (u32, u32), clip: RectPx) -> Option<RectPx> {
+    let iw = image_size.0 as f32;
+    let ih = image_size.1 as f32;
+    let (mut left, mut right) = (mark.x1.min(mark.x2) * iw, mark.x1.max(mark.x2) * iw);
+    let (mut top, mut bottom) = (mark.y1.min(mark.y2) * ih, mark.y1.max(mark.y2) * ih);
+    for point in &mark.points {
+        left = left.min(point.x * iw);
+        right = right.max(point.x * iw);
+        top = top.min(point.y * ih);
+        bottom = bottom.max(point.y * ih);
+    }
+    let padding = match mark.kind {
+        5 => (mark.width as f32 * 5.0).max(16.0),
+        7 => (mark.width.saturating_mul(3).clamp(6, 192) as f32 / 2.0).ceil() + 2.0,
+        9 => (mark.width as f32 / 2.0).ceil() + mark.effect_strength as f32 * 2.0 + 2.0,
+        11 => number_radius(mark) + 3.0,
+        10 => {
+            if let Some(font) = annotation_font(&mark.text) {
+                let scale = font
+                    .pt_to_px_scale(mark.font_size * 72.0 / 96.0)
+                    .unwrap_or_else(|| mark.font_size.into());
+                let lines = wrap_text(&mark.text, font, scale, mark.text_width);
+                right = left
+                    + lines
+                        .iter()
+                        .map(|line| text_size(scale, font, line).0)
+                        .max()
+                        .unwrap_or(0) as f32;
+                let scaled = font.as_scaled(scale);
+                bottom = top + lines.len() as f32 * (scaled.height() + scaled.line_gap());
+            }
+            mark.font_size.max(4.0)
+        }
+        _ => (mark.width as f32 / 2.0).ceil() + 2.0,
+    };
+    let x = (left - padding)
+        .floor()
+        .max(clip.x as f32)
+        .min(clip.right() as f32) as i32;
+    let y = (top - padding)
+        .floor()
+        .max(clip.y as f32)
+        .min(clip.bottom() as f32) as i32;
+    let right = (right + padding)
+        .ceil()
+        .min(clip.right() as f32)
+        .max(x as f32) as i32;
+    let bottom = (bottom + padding)
+        .ceil()
+        .min(clip.bottom() as f32)
+        .max(y as f32) as i32;
+    (right > x && bottom > y).then_some(RectPx::new(x, y, (right - x) as u32, (bottom - y) as u32))
+}
+
 fn draw_mark(img: &mut RgbaImage, mark: &Mark, iw: f32, ih: f32, ox: f32, oy: f32) {
-    let to_pixel = |x: f32, y: f32| (x * iw - ox, y * ih - oy);
-    let (x1, y1) = to_pixel(mark.x1, mark.y1);
-    let (x2, y2) = to_pixel(mark.x2, mark.y2);
+    let (x1, y1) = (mark.x1 * iw, mark.y1 * ih);
+    let (x2, y2) = (mark.x2 * iw, mark.y2 * ih);
     let width = mark.width.max(1);
+    let mut target = RegionCanvas {
+        image: img,
+        origin: (ox as i32, oy as i32),
+        size: (iw as u32, ih as u32),
+    };
 
     match mark.kind {
         1 => {
-            let points = mark_points(mark, iw, ih, ox, oy);
-            draw_freehand(img, &points, mark.color, width);
+            let points = mark_points(mark, iw, ih, 0.0, 0.0);
+            draw_freehand(&mut target, &points, mark.color, width);
         }
-        2 => draw_rectangle(img, (x1, y1), (x2, y2), mark.color, width),
-        3 => draw_ellipse(img, (x1, y1), (x2, y2), mark.color, width),
-        4 => draw_stroke(img, (x1, y1), (x2, y2), mark.color, width),
-        5 => draw_arrow(img, (x1, y1), (x2, y2), mark.color, width),
-        6 => draw_dashed(img, (x1, y1), (x2, y2), mark.color, width),
+        2 => draw_rectangle(&mut target, (x1, y1), (x2, y2), mark.color, width),
+        3 => draw_ellipse(&mut target, (x1, y1), (x2, y2), mark.color, width),
+        13 | 14 => {
+            // 方形和圆形按截图像素约束，分数缩放和非正方形截图不会拉伸比例。
+            let side = (x2 - x1).abs().min((y2 - y1).abs());
+            let end = (x1 + side.copysign(x2 - x1), y1 + side.copysign(y2 - y1));
+            if mark.kind == 13 {
+                draw_rectangle(&mut target, (x1, y1), end, mark.color, width);
+            } else {
+                draw_ellipse(&mut target, (x1, y1), end, mark.color, width);
+            }
+        }
+        4 => draw_stroke(&mut target, (x1, y1), (x2, y2), mark.color, width),
+        5 => draw_arrow(&mut target, (x1, y1), (x2, y2), mark.color, width),
+        6 => draw_dashed(&mut target, (x1, y1), (x2, y2), mark.color, width),
         7 => {
             let points = mark_points(mark, iw, ih, ox, oy);
-            draw_highlight(img, &points, mark.color, width);
+            draw_highlight(target.image, &points, mark.color, width);
         }
         8 | 9 => {
             let points = mark_points(mark, iw, ih, ox, oy);
-            draw_effect_brush(img, &points, width, mark.kind == 9, mark.effect_strength);
+            draw_effect_brush(
+                target.image,
+                &points,
+                width,
+                mark.kind == 9,
+                mark.effect_strength,
+            );
         }
+        11 => draw_number(&mut target, mark, (x1, y1)),
         10 => draw_text(
-            img,
+            &mut target,
             (x1, y1),
             &mark.text,
             mark.color,
@@ -166,6 +296,141 @@ fn draw_mark(img: &mut RgbaImage, mark: &Mark, iw: f32, ih: f32, ox: f32, oy: f3
             mark.text_width,
         ),
         _ => {}
+    }
+}
+
+fn number_radius(mark: &Mark) -> f32 {
+    let size = mark.font_size.max(12.0);
+    let digits = mark.number.to_string().len() as f32;
+    (size * 0.7).max(size * (digits * 0.32 + 0.25))
+}
+
+fn draw_number(canvas: &mut impl Canvas<Pixel = Rgba<u8>>, mark: &Mark, position: (f32, f32)) {
+    let Some(font) = annotation_font("0123456789") else {
+        return;
+    };
+    let text = mark.number.to_string();
+    let size = mark.font_size.max(12.0);
+    let scale = font
+        .pt_to_px_scale(size * 72.0 / 96.0)
+        .unwrap_or_else(|| size.into());
+    // 字体的 text_size 只返回墨迹高度，起笔还带 ascent 偏移；按实际墨迹边界居中。
+    let scaled = font.as_scaled(scale);
+    let (mut cursor, mut last) = (0.0, None);
+    let (mut left, mut top) = (f32::INFINITY, f32::INFINITY);
+    let (mut right, mut bottom) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for character in text.chars() {
+        let id = scaled.glyph_id(character);
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(cursor, scaled.ascent()));
+        cursor += scaled.h_advance(id);
+        if let Some(outline) = scaled.outline_glyph(glyph) {
+            if let Some(last) = last {
+                cursor += scaled.kern(id, last);
+            }
+            last = Some(id);
+            let bounds = outline.px_bounds();
+            left = left.min(bounds.min.x);
+            top = top.min(bounds.min.y);
+            right = right.max(bounds.max.x);
+            bottom = bottom.max(bounds.max.y);
+        }
+    }
+    if !left.is_finite() {
+        return;
+    }
+    let center = (position.0.round() as i32, position.1.round() as i32);
+    draw_filled_circle_mut(
+        canvas,
+        center,
+        number_radius(mark).ceil() as i32,
+        mark.color,
+    );
+    // 深色圆底使用白字，浅色圆底使用深字，保持编号可读。
+    let light = u32::from(mark.color[0]) * 299
+        + u32::from(mark.color[1]) * 587
+        + u32::from(mark.color[2]) * 114;
+    let ink = if light > 160_000 {
+        Rgba([20, 25, 35, 255])
+    } else {
+        Rgba([255, 255, 255, 255])
+    };
+    draw_text_mut(
+        canvas,
+        ink,
+        center.0 - ((left + right) / 2.0).round() as i32,
+        center.1 - ((top + bottom) / 2.0).round() as i32,
+        scale,
+        font,
+        &text,
+    );
+}
+
+/// 橡皮擦仅还原经过笔迹遮罩的像素；不会把截图挖空或重绘其余标注。
+fn erase_mark(canvas: &mut RgbaImage, mark: &Mark, source: &RgbaImage, origin: (i32, i32)) {
+    let clip = RectPx::new(origin.0, origin.1, canvas.width(), canvas.height());
+    let Some(bounds) = mark_bounds(mark, source.dimensions(), clip) else {
+        return;
+    };
+    let mut mask = RgbaImage::new(bounds.width, bounds.height);
+    let mut target = RegionCanvas {
+        image: &mut mask,
+        origin: (bounds.x, bounds.y),
+        size: source.dimensions(),
+    };
+    let points = mark_points(
+        mark,
+        source.width() as f32,
+        source.height() as f32,
+        0.0,
+        0.0,
+    );
+    draw_freehand(&mut target, &points, Rgba([255, 255, 255, 255]), mark.width);
+    for (x, y, coverage) in mask.enumerate_pixels() {
+        if coverage[3] != 0 {
+            let source_x = bounds.x as u32 + x;
+            let source_y = bounds.y as u32 + y;
+            canvas[(
+                (bounds.x - origin.0) as u32 + x,
+                (bounds.y - origin.1) as u32 + y,
+            )] = source[(source_x, source_y)];
+        }
+    }
+}
+
+// 在原图坐标中光栅化，最终整数像素再平移，避免局部预览的浮点减法改变线段栅格。
+struct RegionCanvas<'a> {
+    image: &'a mut RgbaImage,
+    origin: (i32, i32),
+    size: (u32, u32),
+}
+impl Canvas for RegionCanvas<'_> {
+    type Pixel = Rgba<u8>;
+    fn dimensions(&self) -> (u32, u32) {
+        self.size
+    }
+    fn get_pixel(&self, x: u32, y: u32) -> Self::Pixel {
+        let x = x as i64 - i64::from(self.origin.0);
+        let y = y as i64 - i64::from(self.origin.1);
+        if x >= 0
+            && y >= 0
+            && x < i64::from(self.image.width())
+            && y < i64::from(self.image.height())
+        {
+            self.image[(x as u32, y as u32)]
+        } else {
+            Rgba([0, 0, 0, 0])
+        }
+    }
+    fn draw_pixel(&mut self, x: u32, y: u32, color: Self::Pixel) {
+        let x = x as i64 - i64::from(self.origin.0);
+        let y = y as i64 - i64::from(self.origin.1);
+        if x >= 0
+            && y >= 0
+            && x < i64::from(self.image.width())
+            && y < i64::from(self.image.height())
+        {
+            self.image[(x as u32, y as u32)] = color;
+        }
     }
 }
 
@@ -181,7 +446,12 @@ fn mark_points(mark: &Mark, iw: f32, ih: f32, ox: f32, oy: f32) -> Vec<(f32, f32
     }
 }
 
-fn draw_freehand(img: &mut RgbaImage, points: &[(f32, f32)], color: Rgba<u8>, width: u32) {
+fn draw_freehand(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    points: &[(f32, f32)],
+    color: Rgba<u8>,
+    width: u32,
+) {
     if points.is_empty() {
         return;
     }
@@ -200,7 +470,7 @@ fn draw_highlight(img: &mut RgbaImage, points: &[(f32, f32)], color: Rgba<u8>, w
     if points.is_empty() || img.width() == 0 || img.height() == 0 {
         return;
     }
-    let width = width.saturating_mul(3).clamp(6, 40);
+    let width = width.saturating_mul(3).clamp(6, 192);
     let radius = ((width as f32) / 2.0).ceil().max(1.0) as i32;
     let min_x = points
         .iter()
@@ -410,7 +680,7 @@ fn pixelate(source: &RgbaImage, block: u32) -> RgbaImage {
 }
 
 fn draw_text(
-    img: &mut RgbaImage,
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
     position: (f32, f32),
     text: &str,
     color: Rgba<u8>,
@@ -441,13 +711,29 @@ fn draw_text(
 // 与原位输入的逐字换行对应，同时保留用户主动输入的空行。
 fn wrap_text(text: &str, font: &FontArc, scale: ab_glyph::PxScale, max_width: f32) -> Vec<String> {
     let mut lines = Vec::new();
+    let scaled = font.as_scaled(scale);
     for paragraph in text.split('\n') {
         let mut line = String::new();
+        let mut width = 0.0;
+        let mut last = None;
         for character in paragraph.chars().filter(|character| *character != '\r') {
-            let mut next = line.clone();
-            next.push(character);
-            if !line.is_empty() && text_size(scale, font, &next).0 as f32 > max_width {
+            let id = scaled.glyph_id(character);
+            let advance = scaled.h_advance(id);
+            let outlined = font.outline(id).is_some();
+            // 与 imageproc::text_size 的前进量和字距累计顺序一致，每个字形只测量一次。
+            let mut next_width = width + advance;
+            if outlined && let Some(last) = last {
+                next_width += scaled.kern(id, last);
+            }
+            if !line.is_empty() && (next_width as u32) as f32 > max_width {
                 lines.push(std::mem::take(&mut line));
+                width = advance;
+                last = outlined.then_some(id);
+            } else {
+                width = next_width;
+                if outlined {
+                    last = Some(id);
+                }
             }
             line.push(character);
         }
@@ -456,34 +742,57 @@ fn wrap_text(text: &str, font: &FontArc, scale: ab_glyph::PxScale, max_width: f3
     lines
 }
 
-// 保留字体集合索引，便于 Slint 注册同一字体文件中的相同字形。
+// 字体文件在实际需要文字时才打开；回退字体仅在主字体缺字时加载。
+#[derive(Clone)]
 pub struct AnnotationFont {
     pub font: FontArc,
     pub index: u32,
 }
 
-pub fn annotation_fonts() -> &'static [AnnotationFont] {
-    static FONTS: OnceLock<Vec<AnnotationFont>> = OnceLock::new();
-    FONTS.get_or_init(load_annotation_fonts)
+impl AsRef<[u8]> for AnnotationFont {
+    fn as_ref(&self) -> &[u8] {
+        self.font.font_data()
+    }
 }
 
-pub fn annotation_font_index(text: &str) -> Option<usize> {
-    let fonts = annotation_fonts();
-    fonts
-        .iter()
-        .position(|entry| {
-            text.chars()
-                .filter(|character| !character.is_whitespace())
-                .all(|character| entry.font.glyph_id(character).0 != 0)
-        })
-        .or_else(|| (!fonts.is_empty()).then_some(0))
+struct FontCandidate {
+    path: PathBuf,
+    index: u32,
+    loaded: OnceLock<Option<AnnotationFont>>,
+}
+
+pub fn annotation_font_for(text: &str) -> Option<(usize, &'static AnnotationFont)> {
+    static FONTS: OnceLock<Vec<FontCandidate>> = OnceLock::new();
+    let candidates = FONTS.get_or_init(font_candidates);
+    let mut fallback = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        let loaded = candidate.loaded.get_or_init(|| {
+            let data = std::fs::read(&candidate.path).ok()?;
+            let font = FontVec::try_from_vec_and_index(data, candidate.index).ok()?;
+            Some(AnnotationFont {
+                font: FontArc::new(font),
+                index: candidate.index,
+            })
+        });
+        if let Some(entry) = loaded {
+            fallback.get_or_insert((index, entry));
+            if text
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .all(|c| entry.font.glyph_id(c).0 != 0)
+            {
+                return Some((index, entry));
+            }
+        }
+    }
+    fallback
 }
 
 fn annotation_font(text: &str) -> Option<&'static FontArc> {
-    annotation_font_index(text).map(|index| &annotation_fonts()[index].font)
+    annotation_font_for(text).map(|(_, entry)| &entry.font)
 }
 
-fn load_annotation_fonts() -> Vec<AnnotationFont> {
+fn font_candidates() -> Vec<FontCandidate> {
     let default_index = std::env::var("BABRY_FONT_INDEX")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -537,18 +846,21 @@ fn load_annotation_fonts() -> Vec<AnnotationFont> {
     candidates
         .into_iter()
         .filter(|candidate| loaded.insert(candidate.clone()))
-        .filter_map(|(path, index)| {
-            let data = std::fs::read(path).ok()?;
-            let font = FontVec::try_from_vec_and_index(data, index).ok()?;
-            Some(AnnotationFont {
-                font: FontArc::new(font),
-                index,
-            })
+        .map(|(path, index)| FontCandidate {
+            path,
+            index,
+            loaded: OnceLock::new(),
         })
         .collect()
 }
 
-fn draw_rectangle(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>, width: u32) {
+fn draw_rectangle(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: Rgba<u8>,
+    width: u32,
+) {
     let left = a.0.min(b.0);
     let right = a.0.max(b.0);
     let top = a.1.min(b.1);
@@ -570,7 +882,13 @@ fn draw_rectangle(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba
     }
 }
 
-fn draw_ellipse(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>, width: u32) {
+fn draw_ellipse(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: Rgba<u8>,
+    width: u32,
+) {
     let cx = ((a.0 + b.0) / 2.0).round() as i32;
     let cy = ((a.1 + b.1) / 2.0).round() as i32;
     let rx = ((a.0 - b.0).abs() / 2.0).round().max(1.0) as i32;
@@ -588,11 +906,23 @@ fn draw_ellipse(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u
     }
 }
 
-fn draw_stroke(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>, width: u32) {
+fn draw_stroke(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: Rgba<u8>,
+    width: u32,
+) {
     draw_round_segment(img, a, b, color, width);
 }
 
-fn draw_arrow(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>, width: u32) {
+fn draw_arrow(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: Rgba<u8>,
+    width: u32,
+) {
     let dx = b.0 - a.0;
     let dy = b.1 - a.1;
     let length = (dx * dx + dy * dy).sqrt();
@@ -618,7 +948,13 @@ fn draw_arrow(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>
     draw_round_segment(img, b, wing_b, color, width);
 }
 
-fn draw_dashed(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8>, width: u32) {
+fn draw_dashed(
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: Rgba<u8>,
+    width: u32,
+) {
     let dx = b.0 - a.0;
     let dy = b.1 - a.1;
     let length = (dx * dx + dy * dy).sqrt();
@@ -645,7 +981,7 @@ fn draw_dashed(img: &mut RgbaImage, a: (f32, f32), b: (f32, f32), color: Rgba<u8
 }
 
 fn draw_round_segment(
-    img: &mut RgbaImage,
+    img: &mut impl Canvas<Pixel = Rgba<u8>>,
     a: (f32, f32),
     b: (f32, f32),
     color: Rgba<u8>,
@@ -821,19 +1157,50 @@ mod tests {
     }
 
     #[test]
+    fn linear_wrapping_matches_existing_measurement_and_font_data_is_shared() {
+        let Some((_, entry)) = annotation_font_for("Babry") else {
+            return;
+        };
+        let clone = entry.clone();
+        assert_eq!(entry.as_ref().as_ptr(), clone.as_ref().as_ptr());
+        let font = &entry.font;
+        let scale = font.pt_to_px_scale(18.0).unwrap();
+        for text in [
+            "AVATAR To Wo\nBabry",
+            "Hello  world\r\n\nabc",
+            "中文逐字换行，字号保持一致",
+            "Longline",
+        ] {
+            for max_width in [0.0, 1.0, 25.0, 80.0, 1000.0, f32::INFINITY] {
+                let mut expected = Vec::new();
+                for paragraph in text.split('\n') {
+                    let mut line = String::new();
+                    for c in paragraph.chars().filter(|c| *c != '\r') {
+                        let mut next = line.clone();
+                        next.push(c);
+                        if !line.is_empty() && text_size(scale, font, &next).0 as f32 > max_width {
+                            expected.push(std::mem::take(&mut line));
+                        }
+                        line.push(c);
+                    }
+                    expected.push(line);
+                }
+                assert_eq!(wrap_text(text, font, scale, max_width), expected);
+            }
+        }
+    }
+
+    #[test]
     fn export_renders_text_after_a_crop_offset() {
         if annotation_font("A").is_none() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
-        let source_path = directory.path().join("source.png");
         let output_path = directory.path().join("output.png");
         let source = RgbaImage::from_pixel(100, 80, Rgba([20, 30, 40, 255]));
-        DynamicImage::ImageRgba8(source).save(&source_path).unwrap();
-
         let mut mark = Mark::new(10, 0.3, 0.35, 0.3, 0.35, red(), 4);
         mark.set_text("A".to_string());
-        export(&source_path, &output_path, (0.2, 0.25, 0.6, 0.5), &[mark]).unwrap();
+        export(&source, &output_path, (0.2, 0.25, 0.6, 0.5), &[mark]).unwrap();
 
         let output = image::open(&output_path).unwrap().to_rgba8();
         assert_eq!(output.dimensions(), (60, 40));

@@ -36,7 +36,7 @@ pub fn write_diagnostics(source: &Path, directory: &Path) -> Result<(), String> 
     });
 
     let mut overlay = image;
-    let font = editor::annotation_fonts().first().map(|entry| &entry.font);
+    let font = editor::annotation_font_for("0123456789").map(|(_, entry)| &entry.font);
     for (id, candidate) in detector.candidates().iter().enumerate().rev() {
         let rect = candidate.rect;
         let color = if candidate.quality >= 0.85 {

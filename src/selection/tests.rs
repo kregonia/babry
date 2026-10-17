@@ -28,6 +28,15 @@ fn assert_bounds(actual: RectPx, expected: RectPx, tolerance: i32) {
 }
 
 #[test]
+fn cancelled_detection_returns_without_generating_candidates() {
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    let image = canvas(640, 480, 20);
+    let detector = RegionDetector::new_cancellable(&image, &cancelled);
+    assert!(detector.candidates().is_empty());
+    assert_eq!(detector.region_at(0.5, 0.5), RectPx::new(0, 0, 640, 480));
+}
+
+#[test]
 fn flat_and_tiny_images_fall_back_without_panicking() {
     for (w, h) in [(320, 200), (1, 1), (2, 3), (3, 3), (1, 80), (0, 0)] {
         let detector = RegionDetector::new(&canvas(w, h, 40));

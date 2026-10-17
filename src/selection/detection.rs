@@ -8,6 +8,7 @@ use imageproc::{
     morphology::{close, dilate},
     region_labelling::{Connectivity, connected_components},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_ANALYSIS_DIMENSION: u32 = 1280;
 const MAX_PROPOSALS: usize = 4096;
@@ -47,7 +48,10 @@ struct EdgeField {
     threshold: u8,
 }
 
-pub(super) fn detect(image: &RgbaImage) -> Vec<RegionCandidate> {
+pub(super) fn detect(image: &RgbaImage, cancelled: &AtomicBool) -> Vec<RegionCandidate> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let (width, height) = image.dimensions();
     if width < 3 || height < 3 {
         return Vec::new();
@@ -61,9 +65,18 @@ pub(super) fn detect(image: &RgbaImage) -> Vec<RegionCandidate> {
         &resized
     };
     let field = edge_field(analysis);
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let closed = close(&field.combined, Norm::LInf, 1);
     let mut proposals = contour_proposals(&closed);
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     proposals.extend(component_proposals(&closed, false));
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     proposals.extend(line_proposals(&field));
     // 边缘围住的背景区域提供面板/分隔布局线索，不要求面板有完整亮色描边。
     let barriers = dilate(&field.combined, Norm::LInf, 1);
@@ -71,6 +84,9 @@ pub(super) fn detect(image: &RgbaImage) -> Vec<RegionCandidate> {
         Luma([if barriers[(x, y)][0] == 0 { 255 } else { 0 }])
     });
     proposals.extend(component_proposals(&background, true));
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     let scale = width as f32 / aw as f32;
     let min_width = (12.0 / scale).ceil().max(5.0) as u32;
@@ -89,6 +105,9 @@ pub(super) fn detect(image: &RgbaImage) -> Vec<RegionCandidate> {
 
     let mut candidates: Vec<RegionCandidate> = Vec::new();
     for proposal in proposals {
+        if cancelled.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let rect = proposal.rect;
         let sides = border_sides(&field, rect);
         let mut sorted = sides;
@@ -129,6 +148,9 @@ pub(super) fn detect(image: &RgbaImage) -> Vec<RegionCandidate> {
     candidates.truncate(MAX_REFINED);
     let radius = (scale.ceil() as i32 * 3).clamp(3, 16);
     for candidate in &mut candidates {
+        if cancelled.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         candidate.rect = refine_rect(image, candidate.rect, radius, field.threshold);
     }
     let mut refined = Vec::new();

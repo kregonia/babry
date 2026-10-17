@@ -5,6 +5,7 @@ mod tests;
 
 use crate::core::{PointPx, RectPx};
 use image::RgbaImage;
+use std::sync::atomic::AtomicBool;
 
 pub use diagnostics::write_diagnostics;
 
@@ -29,8 +30,13 @@ pub struct RegionDetector {
 
 impl RegionDetector {
     pub fn new(image: &RgbaImage) -> Self {
+        Self::new_cancellable(image, &AtomicBool::new(false))
+    }
+
+    /// 在分析阶段边界检查取消标记，避免确认手动选区后继续精修无用候选。
+    pub fn new_cancellable(image: &RgbaImage, cancelled: &AtomicBool) -> Self {
         let (image_width, image_height) = image.dimensions();
-        let mut candidates = detection::detect(image);
+        let mut candidates = detection::detect(image, cancelled);
         // 优先保留可靠边界，限制照片和复杂网页产生的候选数量。
         candidates.sort_by(|a, b| {
             b.quality
