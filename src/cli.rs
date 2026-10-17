@@ -6,10 +6,36 @@ pub enum Command {
     Screen,
     Pin(PathBuf),
     PinSurface(PathBuf),
-    DebugSelection { source: PathBuf, directory: PathBuf },
+    DebugSelection {
+        source: PathBuf,
+        directory: PathBuf,
+    },
     Help,
-    OnOutput { command: Box<Command>, name: String },
+    OnOutput {
+        command: Box<Command>,
+        name: String,
+    },
     ListOutputs,
+    Daemon,
+    DaemonStatus,
+    StopDaemon,
+    Standalone(Box<Command>),
+    WithSaveDir {
+        command: Box<Command>,
+        directory: PathBuf,
+    },
+}
+
+impl Command {
+    fn is_capture(&self) -> bool {
+        match self {
+            Self::Region | Self::Screen => true,
+            Self::OnOutput { command, .. }
+            | Self::WithSaveDir { command, .. }
+            | Self::Standalone(command) => command.is_capture(),
+            _ => false,
+        }
+    }
 }
 
 pub fn parse<I>(args: I) -> Result<Command, String>
@@ -17,6 +43,38 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut values: Vec<String> = args.into_iter().collect();
+    if let Some(index) = values.iter().position(|arg| arg == "--save-dir") {
+        if index + 1 >= values.len() {
+            return Err("--save-dir 需要目录路径".into());
+        }
+        let directory = values.remove(index + 1);
+        values.remove(index);
+        if directory.is_empty()
+            || directory.starts_with("--")
+            || values.iter().any(|arg| arg == "--save-dir")
+        {
+            return Err("--save-dir 需要唯一且有效的目录路径".into());
+        }
+        let command = parse(values)?;
+        if !command.is_capture() {
+            return Err("--save-dir 仅用于截图".into());
+        }
+        return Ok(Command::WithSaveDir {
+            command: Box::new(command),
+            directory: directory.into(),
+        });
+    }
+    if let Some(index) = values.iter().position(|arg| arg == "--standalone") {
+        values.remove(index);
+        if values.iter().any(|arg| arg == "--standalone") {
+            return Err("--standalone 不能重复".into());
+        }
+        let command = parse(values)?;
+        if !command.is_capture() {
+            return Err("--standalone 仅用于截图".into());
+        }
+        return Ok(Command::Standalone(Box::new(command)));
+    }
     if let Some(index) = values.iter().position(|arg| arg == "--output") {
         if index + 1 >= values.len() {
             return Err("--output 需要显示器名称".into());
@@ -74,6 +132,9 @@ where
                 },
             )
         }
+        "--daemon" => ensure_no_extra(args, Command::Daemon),
+        "--daemon-status" => ensure_no_extra(args, Command::DaemonStatus),
+        "--stop-daemon" => ensure_no_extra(args, Command::StopDaemon),
         "--list-outputs" => ensure_no_extra(args, Command::ListOutputs),
         "--help" | "-h" => ensure_no_extra(args, Command::Help),
         unknown => Err(format!("未知参数: {unknown}\n\n{}", usage())),
@@ -92,7 +153,7 @@ where
 }
 
 pub fn usage() -> &'static str {
-    "用法:\n  babry                    CV 智能区域截图\n  babry --region           CV 智能区域截图\n  babry --smart            CV 智能区域截图\n  babry --screen           全屏截图后进入编辑\n  babry --pin PATH         将 PNG 作为屏幕贴图显示\n  babry --debug-selection IMAGE DIR\n                           输出 CV 候选图和评分 JSON\n  babry --output NAME      在指定显示器截图（可与 --screen 或 --pin 组合）\n  babry --list-outputs     列出显示器及逻辑尺寸、位置、缩放\n  babry --help             显示帮助"
+    "用法:\n  babry                    CV 智能区域截图\n  babry --region           CV 智能区域截图\n  babry --smart            CV 智能区域截图\n  babry --screen           全屏截图后进入编辑\n  babry --pin PATH         将 PNG 作为屏幕贴图显示\n  babry --debug-selection IMAGE DIR\n                           输出 CV 候选图和评分 JSON\n  babry --output NAME      在指定显示器截图（可与 --screen 或 --pin 组合）\n  babry --list-outputs     列出显示器及逻辑尺寸、位置、缩放\n  babry --daemon           常驻后台，现有截图命令自动通过 IPC 唤起\n  babry --daemon-status    查询当前会话的后台状态\n  babry --stop-daemon      退出当前会话的后台\n  babry --standalone       跳过后台，单次截图后退出（可与 --screen/--output 组合）\n  babry --save-dir PATH    覆盖当前截图的保存目录\n  babry --help             显示帮助"
 }
 
 #[cfg(test)]
@@ -153,6 +214,78 @@ mod tests {
         assert!(
             parse_args(&["babry", "--debug-selection", "image.png", "debug", "extra"]).is_err()
         );
+    }
+
+    #[test]
+    fn parses_daemon_commands_and_standalone_with_output() {
+        assert_eq!(parse_args(&["babry", "--daemon"]), Ok(Command::Daemon));
+        assert_eq!(
+            parse_args(&["babry", "--daemon-status"]),
+            Ok(Command::DaemonStatus)
+        );
+        assert_eq!(
+            parse_args(&["babry", "--stop-daemon"]),
+            Ok(Command::StopDaemon)
+        );
+        assert_eq!(
+            parse_args(&["babry", "--standalone", "--screen", "--output", "DP-2"]),
+            Ok(Command::Standalone(Box::new(Command::OnOutput {
+                command: Box::new(Command::Screen),
+                name: "DP-2".into()
+            })))
+        );
+        for args in [
+            ["babry", "--daemon", "--screen"],
+            ["babry", "--standalone", "--daemon"],
+            ["babry", "--standalone", "--standalone"],
+        ] {
+            assert!(parse_args(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn save_directory_combines_with_capture_flags_in_any_order() {
+        for args in [
+            vec![
+                "babry",
+                "--save-dir",
+                "/tmp/截图 目录",
+                "--screen",
+                "--standalone",
+                "--output",
+                "DP-2",
+            ],
+            vec![
+                "babry",
+                "--output",
+                "DP-2",
+                "--standalone",
+                "--screen",
+                "--save-dir",
+                "/tmp/截图 目录",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(&args),
+                Ok(Command::WithSaveDir {
+                    directory: "/tmp/截图 目录".into(),
+                    command: Box::new(Command::Standalone(Box::new(Command::OnOutput {
+                        command: Box::new(Command::Screen),
+                        name: "DP-2".into()
+                    }))),
+                })
+            );
+        }
+        for args in [
+            vec!["babry", "--save-dir"],
+            vec!["babry", "--save-dir", "--screen"],
+            vec!["babry", "--save-dir", ""],
+            vec!["babry", "--save-dir", "/tmp/a", "--save-dir", "/tmp/b"],
+            vec!["babry", "--save-dir", "/tmp/a", "--daemon"],
+            vec!["babry", "--save-dir", "/tmp/a", "--pin", "image.png"],
+        ] {
+            assert!(parse_args(&args).is_err(), "accepted {args:?}");
+        }
     }
 
     #[test]

@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "babry"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "ab_glyph",
  "chrono",
@@ -536,6 +536,7 @@ dependencies = [
  "slint-build",
  "smithay-client-toolkit 0.20.0",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

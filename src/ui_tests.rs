@@ -584,6 +584,171 @@ fn all_selection_edges_and_corners_resize() {
 }
 
 #[test]
+fn session_save_directory_does_not_leak_and_failed_export_keeps_the_document() {
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();
+    let app = AppWindow::new().unwrap();
+    let controller = EditorController::install(&app, Arc::new(RgbaImage::new(1, 1)));
+    let root = tempfile::tempdir().unwrap();
+    let completed = Rc::new(std::cell::Cell::new(0));
+    let state = completed.clone();
+    app.on_session_finished(move || {
+        state.set(state.get() + 1);
+    });
+    for name in ["第一个 目录", "second-session"] {
+        let directory = root.path().join(name);
+        configure_editor(
+            &app,
+            controller.clone(),
+            RgbaImage::from_pixel(640, 480, Rgba([30, 50, 70, 255])),
+            true,
+            "DP-2".into(),
+            StartupTrace::new("test"),
+            directory.clone(),
+        )
+        .unwrap();
+        assert!(
+            !directory.exists(),
+            "opening an editor created its save directory"
+        );
+        app.invoke_save();
+        let files = std::fs::read_dir(directory)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            image::open(files[0].path())
+                .unwrap()
+                .into_rgba8()
+                .dimensions(),
+            (640, 480)
+        );
+    }
+    assert_eq!(completed.get(), 2);
+    let blocked = root.path().join("not-a-directory");
+    std::fs::write(&blocked, "keep this file").unwrap();
+    configure_editor(
+        &app,
+        controller.clone(),
+        RgbaImage::new(640, 480),
+        true,
+        "DP-2".into(),
+        StartupTrace::new("test"),
+        blocked.clone(),
+    )
+    .unwrap();
+    let red = slint::Color::from_rgb_u8(255, 0, 0);
+    app.invoke_begin_mark(11, 0.5, 0.5, red, 4, 0, 8);
+    app.invoke_commit_mark();
+    app.invoke_save();
+    assert_eq!(completed.get(), 2, "failed export closed the editor");
+    assert_eq!(controller.document.borrow().marks().len(), 1);
+    assert_eq!(std::fs::read_to_string(blocked).unwrap(), "keep this file");
+    app.hide().unwrap();
+}
+
+#[test]
+fn reused_editor_receives_save_shortcut_after_showing() {
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();
+    let app = AppWindow::new().unwrap();
+    let controller = EditorController::install(&app, Arc::new(RgbaImage::new(1, 1)));
+    let saved = Rc::new(std::cell::Cell::new(0));
+    for _ in 0..2 {
+        configure_editor(
+            &app,
+            controller.clone(),
+            RgbaImage::new(640, 480),
+            true,
+            "DP-2".into(),
+            StartupTrace::new("test"),
+            std::env::temp_dir(),
+        )
+        .unwrap();
+        window.set_size(PhysicalSize::new(640, 480));
+        let saved = saved.clone();
+        app.on_save(move || {
+            saved.set(saved.get() + 1);
+        });
+        app.window().dispatch_event(WindowEvent::KeyPressed {
+            text: slint::platform::Key::Control.into(),
+        });
+        app.window()
+            .dispatch_event(WindowEvent::KeyPressed { text: "s".into() });
+        app.window()
+            .dispatch_event(WindowEvent::KeyReleased { text: "s".into() });
+        app.window().dispatch_event(WindowEvent::KeyReleased {
+            text: slint::platform::Key::Control.into(),
+        });
+        app.hide().unwrap();
+        controller.release_session(&app);
+    }
+    assert_eq!(saved.get(), 2);
+}
+
+#[test]
+fn resident_controller_releases_frames_and_resets_input_without_reusing_cancel_tokens() {
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();
+    let app = AppWindow::new().unwrap();
+    app.show().unwrap();
+    window.set_size(PhysicalSize::new(640, 480));
+    let controller = EditorController::install(&app, Arc::new(RgbaImage::new(1, 1)));
+    let source = Arc::new(RgbaImage::from_pixel(1280, 960, Rgba([20, 30, 40, 255])));
+    let old_source = Arc::downgrade(&source);
+    controller.reset_session(&app, source.clone());
+    app.set_screenshot(image_to_slint(&source));
+    drop(source);
+    let old_cancel = controller.selection_cancellation();
+    app.set_sx(0.125);
+    app.set_sy(0.125);
+    app.set_sw(0.5);
+    app.set_sh(0.5);
+    app.set_phase(2);
+    app.invoke_editing_started();
+    let red = slint::Color::from_rgb_u8(255, 0, 0);
+    app.invoke_begin_mark(11, 0.3, 0.3, red, 4, 0, 8);
+    app.invoke_commit_mark();
+    app.set_tool(10);
+    click(&app, 200.0, 180.0);
+    app.set_text_value("old pending text".into());
+    app.invoke_update_text("old pending text".into());
+    app.set_open_menu(3);
+    app.set_selection_loading(true);
+    controller.release_session(&app);
+    assert!(old_cancel.load(Ordering::Relaxed));
+    assert!(
+        old_source.upgrade().is_none(),
+        "idle daemon retained the old screenshot"
+    );
+    assert_eq!(controller.document.borrow().source().dimensions(), (1, 1));
+    assert!(controller.document.borrow().marks().is_empty());
+    assert!(controller.document.borrow().committed().is_none());
+    assert_eq!(app.get_screenshot().size(), (0, 0).into());
+    assert_eq!(app.get_committed_image().size(), (0, 0).into());
+    assert_eq!(app.get_preview_image().size(), (0, 0).into());
+    assert_eq!(app.get_tool(), 0);
+    assert_eq!(app.get_open_menu(), 0);
+    assert!(app.get_text_value().is_empty());
+    assert_eq!(app.get_next_number(), 1);
+    let next = Arc::new(RgbaImage::from_pixel(600, 400, Rgba([60, 70, 80, 255])));
+    controller.reset_session(&app, next);
+    let new_cancel = controller.selection_cancellation();
+    assert!(!new_cancel.load(Ordering::Relaxed));
+    assert!(!Arc::ptr_eq(&old_cancel, &new_cancel));
+    assert_eq!(
+        controller.document.borrow().source().dimensions(),
+        (600, 400)
+    );
+    assert_eq!(app.get_phase(), 0);
+    assert_eq!(app.get_sw(), 0.0);
+    app.invoke_undo();
+    assert!(controller.document.borrow().marks().is_empty());
+    app.hide().unwrap();
+}
+
+#[test]
 fn editor_uses_local_images_and_keeps_pending_operations_out_of_exports() {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(TestPlatform(window.clone()))).unwrap();

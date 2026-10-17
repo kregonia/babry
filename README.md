@@ -145,6 +145,62 @@ babry --help           # 查看完整帮助
 
 `--window` 和 `-w` 仍作为兼容别名保留，但现在使用 Babry 自己的 CV 选区，不调用 `niri msg`。
 
+### 图片保存目录
+
+未配置时，图片保存到 `XDG_PICTURES_DIR` 环境变量指定的目录，否则使用 `~/Pictures`；没有 `HOME` 时使用当前目录。文件名为 `babry-年月日-时分秒-毫秒.png`。保存、复制和贴图都会先在此目录生成 PNG。
+
+持久设置可写入 `~/.config/babry/config.toml`；设置了 `XDG_CONFIG_HOME` 时，改用 `$XDG_CONFIG_HOME/babry/config.toml`。示例见 [config.example.toml](docs/config.example.toml)：
+
+```toml
+save_dir = "~/Pictures/Screenshots"
+```
+
+单次指定或通过环境变量覆盖：
+
+```bash
+babry --save-dir ~/Pictures/Work
+babry --screen --save-dir "/mnt/data/我的截图"
+babry --standalone --output DP-1 --save-dir ./screenshots
+BABRY_SAVE_DIR=~/Pictures/Babry babry
+```
+
+优先级为 **`--save-dir` → `BABRY_SAVE_DIR` → 配置文件 `save_dir` → `XDG_PICTURES_DIR` → `~/Pictures`**。配置值支持 `~/`、`$HOME/`、`${HOME}/`；配置中的相对路径以配置文件所在目录为基准，命令行和环境变量中的相对路径以本次调用的工作目录为基准。目录只在实际导出时创建；创建或写入失败会报告错误并保留编辑窗口。
+
+后台模式每次截图由调用端重新读取配置并传递保存目录，修改配置无需重启后台，临时 `--save-dir` 不会改变后续截图的默认目录。配置文件不会自动创建或覆盖。
+
+### 常驻后台加速唤起
+
+在图形会话中先启动一次后台：
+
+```bash
+babry --daemon
+```
+
+该命令在前台运行，可由合成器管理。后台启动后，原有的 `babry`、`babry --screen` 和 `--output NAME` 截图命令会通过当前 Wayland 会话的 Unix socket 唤起它，无需修改截图快捷键。每次请求都会获取新截图；已有截图正在选择或编辑时，重复请求会提示忙碌，不覆盖当前内容。保存、复制、贴图、取消或关闭编辑窗口后，后台释放该次截图、标注历史和 CV 候选，继续等待。Pin 仍运行在独立进程中。
+
+```bash
+babry --daemon-status          # 查看当前会话的后台状态
+babry --stop-daemon            # 退出后台（同时关闭尚未完成的编辑窗口）
+babry --standalone             # 本次跳过后台，截图结束后退出
+babry --standalone --screen    # 独立全屏截图，可继续组合 --output
+```
+
+后台未运行时，普通截图命令自动按独立模式执行，不强制常驻。后台模式下，命令返回表示截图请求已接收；后续截图失败通过通知和后台 stderr 报告。
+
+niri 可在配置顶层加入：
+
+```kdl
+spawn-at-startup "babry" "--daemon"
+```
+
+Hyprland 可加入：
+
+```ini
+exec-once = babry --daemon
+```
+
+常驻会保留 Slint 运行时、字体和部分系统/图形缓存，交换更低的唤起延迟。它不在空闲时循环截图或轮询鼠标，也不保存上一帧供下一次使用。Wayland 隐藏编辑窗口时，Slint 会销毁其原生窗口和图形上下文，后台不保证永久保留 GPU 资源。内存较少、截图较少时可以使用独立模式。
+
 ## 交互方式
 
 ### 选区阶段
@@ -245,7 +301,7 @@ TrueType Collection（`.ttc`）可以通过 `BABRY_FONT_INDEX` 选择字体索�
 Wayland 桌面
     │
     ▼
-  grim ──► 原始 PNG ──► imageproc CV 检测器
+  grim ──► PPM 管道 / 内存原图 ──► imageproc CV 检测器
                               │
                               ▼
                       Slint 选区交互层
@@ -263,6 +319,9 @@ Wayland 桌面
 src/
 ├── capture.rs          # grim 截图、通知和剪贴板
 ├── cli.rs              # 命令解析与帮助文本
+├── config.rs           # 保存目录配置、路径展开与导出文件名
+├── daemon.rs           # 会话 Unix socket、实例锁和后台协议
+├── startup.rs          # 启动阶段计时与后台空闲内存回收
 ├── core/
 │   ├── geometry.rs     # 像素几何与归一化坐标
 │   └── history.rs      # 撤销/重做历史
@@ -297,6 +356,20 @@ cargo build --release --locked
 ```
 
 当前测试覆盖 CLI、几何、历史、编辑渲染、字体文字导出、局部画布、撤销重做、贴图尺寸，以及弱边界、等亮度色块、圆角、密集文字和 4K 小控件的 CV 回归。界面事件测试验证滚轮层级切换、单击确认、手动拖框和局部图像生命周期。
+
+### 启动性能定位
+
+交互截图使用 `grim -t ppm -o NAME -` 管道，把无压缩像素直接解码到内存，省去截图阶段的 PNG 压缩和临时文件。最终保存和复制仍导出 PNG。后台复用 Slint 界面、控制器和字体注册；耗时的截图/解码在线程中运行，CV 独立后台分析，旧任务的取消标记不会复用于新会话。
+
+设置 `BABRY_TRACE_STARTUP=1` 后，stderr 会输出 JSON 阶段耗时：
+
+```bash
+BABRY_TRACE_STARTUP=1 babry --standalone --screen
+BABRY_TRACE_STARTUP=1 babry --daemon
+# 在另一终端运行 babry 或 babry --screen
+```
+
+`output` 为显示器查询完成，`capture-ready` 为截图管道及解码完成，`ui-prepared` 为像素上传准备完成，`first-render` 为 Slint 首次完成场景渲染。最后一项位于显示呈现之前，不等同于合成器显示完成，也不包含后台模式客户端进程启动和 IPC 之前的时间。软件渲染器等不支持渲染通知时会报告埋点不可用。不要把同一台已预热机器的测量视为所有低配设备的冷启动结果。
 
 ### 编辑性能与基准
 

@@ -25,7 +25,7 @@ pub struct EditorController {
     preview_timer: slint::Timer,
     dirty: Cell<bool>,
     last_frame: Cell<Instant>,
-    selection_cancelled: Arc<AtomicBool>,
+    selection_cancelled: RefCell<Arc<AtomicBool>>,
 }
 
 impl EditorController {
@@ -36,7 +36,7 @@ impl EditorController {
             preview_timer: slint::Timer::default(),
             dirty: Cell::new(false),
             last_frame: Cell::new(Instant::now() - PREVIEW_INTERVAL),
-            selection_cancelled: Arc::new(AtomicBool::new(false)),
+            selection_cancelled: RefCell::new(Arc::new(AtomicBool::new(false))),
         });
         {
             let weak = app.as_weak();
@@ -44,7 +44,7 @@ impl EditorController {
             app.on_editing_started(move || {
                 if let Some(app) = weak.upgrade() {
                     state.document.borrow_mut().select(selection(&app));
-                    state.selection_cancelled.store(true, Ordering::Relaxed);
+                    state.cancel_selection();
                     // 阶段切换后释放候选回调所持有的检测器。
                     app.on_hover_selection(|_, _| {});
                     app.on_cycle_selection(|_, _, _| {});
@@ -236,10 +236,10 @@ impl EditorController {
             let weak = app.as_weak();
             let state = controller.clone();
             app.on_cancel(move || {
-                state.selection_cancelled.store(true, Ordering::Relaxed);
+                state.cancel_selection();
                 state.stop_preview();
                 if let Some(app) = weak.upgrade() {
-                    app.hide().ok();
+                    app.invoke_session_finished();
                 }
             });
         }
@@ -247,7 +247,37 @@ impl EditorController {
     }
 
     pub fn selection_cancellation(&self) -> Arc<AtomicBool> {
-        self.selection_cancelled.clone()
+        self.selection_cancelled.borrow().clone()
+    }
+
+    fn cancel_selection(&self) {
+        self.selection_cancelled
+            .borrow()
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// 后台复用控制器及字体注册；每次截图使用独立取消标记，旧分析不能污染新会话。
+    pub fn reset_session(&self, app: &AppWindow, source: Arc<RgbaImage>) {
+        self.release_session(app);
+        *self.selection_cancelled.borrow_mut() = Arc::new(AtomicBool::new(false));
+        *self.document.borrow_mut() = EditorDocument::new(source);
+        self.last_frame.set(Instant::now() - PREVIEW_INTERVAL);
+    }
+
+    /// 空闲时仅保留界面和字体缓存，释放截图、编辑历史、画布及检测器闭包。
+    pub fn release_session(&self, app: &AppWindow) {
+        self.cancel_selection();
+        self.stop_preview();
+        app.on_hover_selection(|_, _| {});
+        app.on_cycle_selection(|_, _, _| {});
+        app.invoke_reset_session();
+        app.set_selection_loading(false);
+        app.set_screenshot(Default::default());
+        app.set_committed_image(Default::default());
+        app.set_has_committed(false);
+        app.set_next_number(1);
+        clear_preview(app);
+        *self.document.borrow_mut() = EditorDocument::new(Arc::new(RgbaImage::new(1, 1)));
     }
 
     fn request_preview(self: &Rc<Self>, app: &AppWindow) {

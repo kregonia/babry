@@ -1,0 +1,10 @@
+# 复制到 ~/.config/babry/config.toml
+# 若设置了 XDG_CONFIG_HOME，则使用 $XDG_CONFIG_HOME/babry/config.toml。
+
+# 图片保存目录；不存在时，在保存/复制/贴图时自动创建。
+# 支持绝对路径、~/、$HOME/、${HOME}/。
+# 相对路径以本配置文件所在目录为基准。
+save_dir = "~/Pictures/Babry"
+
+# 优先级：--save-dir > BABRY_SAVE_DIR > 本配置 > XDG_PICTURES_DIR > ~/Pictures。
+# 后台模式每次由调用端重新读取配置，无需重启后台。
