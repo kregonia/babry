@@ -42,7 +42,7 @@
 - 在同一个界面完成标注、文字、复制、保存和贴图。
 
 > [!NOTE]
-> Babry 当前支持 Linux Wayland 下的 niri 和 Hyprland。CV 选区使用 Rust 的 `imageproc` 内置实现，不依赖 `slurp`、选区 IPC 或系统 OpenCV 动态库。
+> Babry 当前支持 Linux Wayland 下的 niri、Hyprland 和 KDE Plasma 6.8+。CV 选区使用 Rust 的 `imageproc` 内置实现，不依赖 `slurp`、选区 IPC 或系统 OpenCV 动态库。
 
 ## 预览
 
@@ -75,12 +75,12 @@
 | 能力 | 体验 |
 | --- | --- |
 | **CV 智能选区** | 自适应边缘、颜色边界、背景连通域与长直线分析；质量评分、原图边界精修、滚轮切换层级 |
-| **全屏截图** | `grim` 获取当前 Wayland 桌面，`--screen` 直接进入编辑 |
+| **全屏截图** | `grim`（niri/Hyprland）或 KWin 截屏接口（KDE Plasma 6.8+）获取当前 Wayland 桌面，`--screen` 直接进入编辑 |
 | **标注工具** | 画笔、矩形/圆形/方形、圈号递增数字标注、橡皮擦和半透明荧光笔 |
 | **隐私处理** | 局部马赛克与连续轨迹模糊，可调节模糊度 |
 | **原位文字** | 直接在画布输入，多行换行；字号、字体和颜色与导出同步 |
 | **工作流** | 实时预览、撤销/重做、保存 PNG、复制到剪贴板、Wayland 贴图 |
-| **轻依赖** | Rust + Slint + imageproc；不要求系统 OpenCV、slurp 或 niri 选区命令 |
+| **轻依赖** | Rust + Slint + imageproc；KDE 后端使用纯 Rust 的 zbus，不要求系统 OpenCV、slurp 或 niri 选区命令 |
 
 ## 快速开始
 
@@ -123,12 +123,16 @@ install -Dm755 target/release/babry ~/.local/bin/babry
 
 ### 2. 安装运行依赖
 
-截图需要 `grim`，复制图片需要 `wl-clipboard`；可选的 `notify-send` 用于状态通知。AUR 包已声明 Fontconfig、xkbcommon 和 Wayland 系统库依赖，截图和剪贴板工具请按需安装。
+截图在 niri/Hyprland 上需要 `grim`；KDE Plasma 6.8+ 直接调用 KWin 自带的 `org.kde.KWin.ScreenShot2`，无需额外安装。复制图片需要 `wl-clipboard`；可选的 `notify-send` 用于状态通知。AUR 包已声明 Fontconfig、xkbcommon 和 Wayland 系统库依赖，截图和剪贴板工具请按需安装。
 
 Arch Linux：
 
 ```bash
+# niri / Hyprland
 yay -S grim wl-clipboard libnotify
+
+# KDE Plasma 6.8+（无需 grim）
+yay -S wl-clipboard libnotify
 ```
 
 ### 3. 开始截图
@@ -139,7 +143,7 @@ babry --smart          # 同上，显式使用智能选区
 babry --screen         # 截取全屏并直接进入编辑
 babry --pin image.png  # 将已有 PNG 作为屏幕贴图
 babry --output DP-1 --screen # 指定显示器截图
-babry --list-outputs   # 列出 niri/Hyprland 显示器信息
+babry --list-outputs   # 列出当前会话的显示器信息
 babry --help           # 查看完整帮助
 ```
 
@@ -244,7 +248,7 @@ CV 分析在每次截图时由后台线程执行一次，悬停不会重新处�
 
 ## 合成器与多显示器
 
-Babry 会根据 `XDG_CURRENT_DESKTOP` 选择 niri 或 Hyprland 的 IPC，读取每个显示器的名称、逻辑位置、逻辑尺寸和缩放比例。
+Babry 会根据 `XDG_CURRENT_DESKTOP` 与合成器环境变量（`NIRI_SOCKET`、`HYPRLAND_INSTANCE_SIGNATURE`、`KDE_FULL_SESSION`）选择 niri、Hyprland 或 KDE Plasma 6.8+，读取每个显示器的名称、逻辑位置、逻辑尺寸和缩放比例。
 
 ```bash
 babry --list-outputs
@@ -252,9 +256,17 @@ babry --output DP-1 --screen
 babry --output DP-1 --pin image.png
 ```
 
-`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。默认启动会先通过 IPC 确定焦点显示器，再调用 `grim -o NAME` 只截取该屏幕；niri 通过 `focused-output` 查询焦点。无法获取焦点时使用第一个启用的显示器，IPC 查询失败则报告错误。指定不存在的显示器会报错。
+`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。KDE 上输出信息通过 Wayland `xdg_output` 读取，分数缩放由当前 mode 的物理尺寸除以逻辑尺寸推导（KWin 的 `wl_output.scale` 是向上取整的整数），焦点显示器通过 `org.kde.KWin.activeOutputName()` 查询。默认启动会先确定焦点显示器，再只截取该屏幕：niri/Hyprland 调用 `grim -o NAME`，KDE 调用 KWin 的 `org.kde.KWin.ScreenShot2` D-Bus 接口（返回原始像素，不经过 XDG Portal；Plasma 6.8 起无需额外桌面文件声明）。无法获取焦点时使用第一个启用的显示器；niri/Hyprland 的 IPC 查询失败会报告错误，KDE 的焦点查询失败会记录警告并回退到第一个输出。指定不存在的显示器会报错。
 
 当前截图按指定显示器单独捕获，贴图初始尺寸也按目标显示器的逻辑尺寸和缩放计算。跨显示器拖动、把同一张贴图动态迁移到另一块输出，以及不同输出间的实时 layer-shell 重绑定仍在完善中。
+
+### KDE Plasma 6.8+
+
+- 截图走 KWin 自带的 `org.kde.KWin.ScreenShot2`（Spectacle 同款），无需安装 `grim`。
+- 编辑器窗口在 KDE 上全屏覆盖桌面（含面板）；niri/Hyprland 的全屏行为保持不变，继续使用各自窗口规则。
+- Plasma 6.8 之前的 ScreenShot2 需要桌面文件声明 `X-KDE-DBUS-Restricted-Interfaces`，Babry 暂不支持这些版本。
+- 窗口创建瞬间任务栏可能闪现一帧条目，Alt+Tab 中也可能可见；这是 KWin 在窗口 map 与全屏生效之间的行为，不影响截图。
+- KWin 在锁屏/熄屏期间返回黑帧，属安全行为，与 XDG Portal 一致。
 
 ## niri 配置
 
@@ -301,24 +313,36 @@ TrueType Collection（`.ttc`）可以通过 `BABRY_FONT_INDEX` 选择字体索�
 Wayland 桌面
     │
     ▼
-  grim ──► PPM 管道 / 内存原图 ──► imageproc CV 检测器
-                              │
-                              ▼
-                      Slint 选区交互层
-                              │
-                              ▼
-                    Slint 标注编辑器
-                      │      │      │
-                      ▼      ▼      ▼
-                   PNG 保存  剪贴板  layer-shell 贴图
+  grim（niri/Hyprland）或 KWin ScreenShot2（KDE Plasma 6.8+）
+    │
+    ▼
+  内存原图（PPM 管道 / 原始像素）
+    │
+    ▼
+  imageproc CV 检测器
+    │
+    ▼
+  Slint 选区交互层
+    │
+    ▼
+  Slint 标注编辑器
+    │      │      │
+    ▼      ▼      ▼
+ PNG 保存  剪贴板  layer-shell 贴图
 ```
 
 ### 项目结构
 
 ```text
 src/
-├── capture.rs          # grim 截图、通知和剪贴板
+├── capture.rs          # 通知与剪贴板
 ├── cli.rs              # 命令解析与帮助文本
+├── compositor.rs       # 合成器策略接口、后端检测与显示器选择
+├── compositor/
+│   ├── grim.rs         # grim PPM 管道（niri/Hyprland）
+│   ├── hyprland.rs     # Hyprland 输出枚举
+│   ├── kde.rs          # KDE Plasma 6.8+：KWin ScreenShot2 与输出枚举
+│   └── niri.rs         # niri 输出枚举
 ├── config.rs           # 保存目录配置、路径展开与导出文件名
 ├── daemon.rs           # 会话 Unix socket、实例锁和后台协议
 ├── startup.rs          # 启动阶段计时与后台空闲内存回收
@@ -355,11 +379,11 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-当前测试覆盖 CLI、几何、历史、编辑渲染、字体文字导出、局部画布、撤销重做、贴图尺寸，以及弱边界、等亮度色块、圆角、密集文字和 4K 小控件的 CV 回归。界面事件测试验证滚轮层级切换、单击确认、手动拖框和局部图像生命周期。
+当前测试覆盖 CLI、几何、历史、编辑渲染、字体文字导出、局部画布、撤销重做、贴图尺寸与拖动位移，以及弱边界、等亮度色块、圆角、密集文字和 4K 小控件的 CV 回归；合成器后端覆盖 niri/Hyprland JSON 解析、KDE raw 像素解包、分数缩放推导和会话检测。界面事件测试验证滚轮层级切换、单击确认、手动拖框和局部图像生命周期。
 
 ### 启动性能定位
 
-交互截图使用 `grim -t ppm -o NAME -` 管道，把无压缩像素直接解码到内存，省去截图阶段的 PNG 压缩和临时文件。最终保存和复制仍导出 PNG。后台复用 Slint 界面、控制器和字体注册；耗时的截图/解码在线程中运行，CV 独立后台分析，旧任务的取消标记不会复用于新会话。
+交互截图在 niri/Hyprland 上使用 `grim -t ppm -o NAME -` 管道，在 KDE 上使用 ScreenShot2 返回的原始像素，二者都直接解码到内存，省去截图阶段的 PNG 压缩和临时文件。最终保存和复制仍导出 PNG。后台复用 Slint 界面、控制器和字体注册；耗时的截图/解码在线程中运行，CV 独立后台分析，旧任务的取消标记不会复用于新会话。
 
 设置 `BABRY_TRACE_STARTUP=1` 后，stderr 会输出 JSON 阶段耗时：
 
@@ -406,7 +430,7 @@ babry --debug-selection screenshot.png /tmp/babry-cv-debug
 
 ## 当前边界
 
-- 编辑器在 niri 下依赖 `open-fullscreen` 窗口规则；未配置时会按普通窗口显示。
+- 编辑器在 niri 下依赖 `open-fullscreen` 窗口规则；未配置时会按普通窗口显示。KDE Plasma 6.8+ 会自动全屏覆盖桌面。
 - CV 识别不到明确边界时会回退到全屏，仍可拖动鼠标精确框选。
 - 跨显示器拖动 Pin、OCR、贴图持久化和滚动长截图尚未实现。
 - Pin 支持 `wp_viewporter` 时，拖动缩放直接由合成器完成；不支持时使用 CPU 重采样回退。
