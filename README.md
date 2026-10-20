@@ -410,8 +410,10 @@ cargo run --release --locked --example editor_bench
 在提供 layer-shell / viewporter 的 Wayland 会话中，可手动运行 Pin 集成测试：
 
 ```bash
-cargo test --locked --lib pin::tests::viewport_resize_reuses_one_buffer_and_releases_source_pixels -- --ignored
+cargo test --locked --lib pin::tests:: -- --ignored
 ```
+
+集成测试同时检查缩放复用缓冲区，以及重复指针事件、松手同帧的末次移动、四边四角缩放和边界反向拖动。niri 的隐式抓取坐标与 KWin 的表面局部坐标分别处理，避免表面移动回发事件造成贴图持续漂移；位置和尺寸未变化时不会重复提交。
 
 ### 检查 CV 选区
 
