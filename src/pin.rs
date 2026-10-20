@@ -183,7 +183,8 @@ fn create_pin(
         y,
         dragging: false,
         resizing: None,
-        last_pointer: None,
+        grab: None,
+        press_geometry: (0, 0, 0, 0),
         first_configure: true,
         pending_redraw: true,
         exit: false,
@@ -216,7 +217,11 @@ struct PinSurface {
     y: i32,
     dragging: bool,
     resizing: Option<ResizeEdge>,
-    last_pointer: Option<(f64, f64)>,
+    /// 按下时指针的抓取点（面局部坐标）与当时几何。
+    /// 移动/缩放使用“按下几何 + 指针全局位移”的总量公式：面局部坐标会随表面移动跳变，
+    /// 总量公式可抵消该跳变，避免与合成器回发的 motion 形成反馈。
+    grab: Option<(f64, f64)>,
+    press_geometry: (i32, i32, u32, u32),
     first_configure: bool,
     pending_redraw: bool,
     exit: bool,
@@ -250,7 +255,7 @@ impl PinSurface {
             )
             .map_err(|error| format!("无法创建贴图缓冲区: {error}"))?;
 
-        for (pixel, chunk) in image.pixels().zip(canvas.chunks_exact_mut(4)) {
+        for (pixel, chunk) in image.pixels().zip(canvas.as_chunks_mut::<4>().0) {
             // Wayland ARGB8888 使用预乘 alpha；截图通常不透明，也支持透明 PNG。
             let alpha = u16::from(pixel[3]);
             chunk.copy_from_slice(&[
@@ -276,11 +281,11 @@ impl PinSurface {
         Ok(())
     }
 
-    fn move_by(&mut self, dx: f64, dy: f64) {
+    fn move_to(&mut self, x: f64, y: f64) {
         let max_x = self.screen_width.saturating_sub(self.display_size.0) as i32;
         let max_y = self.screen_height.saturating_sub(self.display_size.1) as i32;
-        self.x = (self.x + dx.round() as i32).clamp(0, max_x);
-        self.y = (self.y + dy.round() as i32).clamp(0, max_y);
+        self.x = (x.round() as i32).clamp(0, max_x);
+        self.y = (y.round() as i32).clamp(0, max_y);
         self.layer.set_margin(self.y, 0, 0, self.x);
         self.layer.commit();
     }
@@ -310,24 +315,37 @@ fn resize_edge_at(position: (f64, f64), width_px: u32, height_px: u32) -> Option
     }
 }
 
+fn pointer_delta(
+    surface_origin: i32,
+    pointer_local: f64,
+    press_origin: i32,
+    grab_local: f64,
+) -> f64 {
+    f64::from(surface_origin) + pointer_local - f64::from(press_origin) - grab_local
+}
+
 impl PinSurface {
-    fn resize_by(&mut self, edge: ResizeEdge, dx: f64, dy: f64) {
-        let old_width = self.display_size.0 as f64;
-        let old_height = self.display_size.1 as f64;
+    /// 从按下时的几何出发应用缩放总量，保证拖动反向时不残留累计误差。
+    fn resize_from_press(&mut self, edge: ResizeEdge, total_dx: f64, total_dy: f64) {
+        let (press_x, press_y, press_width, press_height) = self.press_geometry;
+        let old_width = press_width as f64;
+        let old_height = press_height as f64;
         let (mut left, mut top, mut right, mut bottom) = (
-            self.x as f64,
-            self.y as f64,
-            self.x as f64 + old_width,
-            self.y as f64 + old_height,
+            press_x as f64,
+            press_y as f64,
+            press_x as f64 + old_width,
+            press_y as f64 + old_height,
         );
         match edge {
-            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => left += dx,
-            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => right += dx,
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => left += total_dx,
+            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => right += total_dx,
             _ => {}
         }
         match edge {
-            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => top += dy,
-            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => bottom += dy,
+            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => top += total_dy,
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+                bottom += total_dy
+            }
             _ => {}
         }
         let min = MIN_PIN_SIZE as f64;
@@ -674,6 +692,8 @@ impl PointerHandler for PinSurface {
         events: &[PointerEvent],
     ) {
         let mut zoom_factor = 1.0;
+        // 一帧只应用最后一次指针位置，避免逐事件 commit 风暴；总量公式也能自我修正。
+        let mut last_motion: Option<(f64, f64)> = None;
 
         for event in events {
             if &event.surface != self.layer.wl_surface() {
@@ -681,21 +701,14 @@ impl PointerHandler for PinSurface {
             }
             match event.kind {
                 PointerEventKind::Motion { .. } if self.dragging || self.resizing.is_some() => {
-                    if let Some(last) = self.last_pointer {
-                        let dx = event.position.0 - last.0;
-                        let dy = event.position.1 - last.1;
-                        if let Some(edge) = self.resizing {
-                            self.resize_by(edge, dx, dy);
-                        } else {
-                            self.move_by(dx, dy);
-                        }
-                    }
-                    self.last_pointer = Some(event.position);
+                    last_motion = Some(event.position);
                 }
                 PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
                     self.resizing = self.resize_edge_at(event.position);
                     self.dragging = self.resizing.is_none();
-                    self.last_pointer = Some(event.position);
+                    self.grab = Some(event.position);
+                    self.press_geometry =
+                        (self.x, self.y, self.display_size.0, self.display_size.1);
                 }
                 PointerEventKind::Press { button, .. } if button == RIGHT_BUTTON => {
                     self.exit = true;
@@ -703,7 +716,7 @@ impl PointerHandler for PinSurface {
                 PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
                     self.dragging = false;
                     self.resizing = None;
-                    self.last_pointer = None;
+                    self.grab = None;
                 }
                 PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
                     let delta = if vertical.value120 != 0 {
@@ -714,6 +727,19 @@ impl PointerHandler for PinSurface {
                     zoom_factor = if delta < 0.0 { 1.1 } else { 0.9 };
                 }
                 _ => {}
+            }
+        }
+
+        // 指针全局位移 = 当前面局部位置 + 当前表面原点 - 按下时的对应量；
+        // 表面移动引起的面局部坐标跳变在式中相互抵消，不受移动反馈影响。
+        if let (Some((grab_x, grab_y)), Some((pointer_x, pointer_y))) = (self.grab, last_motion) {
+            let (press_x, press_y, ..) = self.press_geometry;
+            let total_dx = pointer_delta(self.x, pointer_x, press_x, grab_x);
+            let total_dy = pointer_delta(self.y, pointer_y, press_y, grab_y);
+            if let Some(edge) = self.resizing {
+                self.resize_from_press(edge, total_dx, total_dy);
+            } else if self.dragging {
+                self.move_to(press_x as f64 + total_dx, press_y as f64 + total_dy);
             }
         }
 
@@ -756,6 +782,16 @@ mod tests {
             Some(ResizeEdge::TopLeft)
         );
         assert_eq!(resize_edge_at((200.0, 150.0), 400, 300), None);
+    }
+
+    #[test]
+    fn drag_delta_cancels_surface_local_jumps() {
+        // 按下：表面原点 100，局部 200（全局 300），抓取点 200。
+        assert_eq!(pointer_delta(100, 200.0, 100, 200.0), 0.0);
+        // 指针全局移动 +50，表面已跟着移动：局部坐标回到 200，总量仍是 50。
+        assert_eq!(pointer_delta(150, 200.0, 100, 200.0), 50.0);
+        // 表面还没跟上时，局部坐标是 250，总量同样是 50。
+        assert_eq!(pointer_delta(100, 250.0, 100, 200.0), 50.0);
     }
 
     #[test]
