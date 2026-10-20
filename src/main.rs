@@ -1,5 +1,7 @@
 use babry::{
-    capture, cli, config, daemon, pin,
+    capture, cli,
+    compositor::{self, Backend},
+    config, daemon, pin,
     selection::{self, RegionDetector, SelectionCursor},
     startup::StartupTrace,
 };
@@ -143,20 +145,22 @@ fn stop_daemon() -> Result<(), String> {
 fn capture_source(
     output: Option<String>,
     mode: &'static str,
-) -> Result<(RgbaImage, String, StartupTrace), String> {
+) -> Result<(RgbaImage, String, StartupTrace, Backend), String> {
     let trace = StartupTrace::new(mode);
-    let outputs = babry::compositor::outputs()?;
-    let selected = babry::compositor::select_output(&outputs, output.as_deref())?;
+    let backend = Backend::detect()?;
+    let compositor = backend.compositor();
+    let outputs = compositor.outputs()?;
+    let selected = compositor::select_output(&outputs, output.as_deref())?;
     trace.mark("output");
-    let base = capture::capture_image(&selected.name)?;
-    // PPM 解码与 grim 管道读取重叠，只记录像素可用点，避免伪造独立的解码耗时。
+    let base = compositor.capture(&selected.name)?;
+    // 读取与解码都包含在 capture 内，只记录像素可用点，不单独拆分解码耗时。
     trace.mark("capture-ready");
-    Ok((base, selected.name, trace))
+    Ok((base, selected.name, trace, backend))
 }
 
 fn run_capture(direct_edit: bool, output: Option<String>, save_dir: PathBuf) -> Result<(), String> {
-    let (base, output_name, trace) = capture_source(output, "standalone-ppm")?;
-    run_editor(base, direct_edit, output_name, trace, save_dir)
+    let (base, output_name, trace, backend) = capture_source(output, "standalone")?;
+    run_editor(base, direct_edit, output_name, trace, backend, save_dir)
 }
 
 fn run_editor(
@@ -164,9 +168,14 @@ fn run_editor(
     direct_edit: bool,
     output_name: String,
     trace: StartupTrace,
+    backend: Backend,
     save_dir: PathBuf,
 ) -> Result<(), String> {
     let app = AppWindow::new().map_err(|error| error.to_string())?;
+    // KDE 的浮动窗口会被面板挤压；平铺合成器已有自己的全屏规则，不改变其行为。
+    if backend == Backend::Kde {
+        app.window().set_fullscreen(true);
+    }
     slint::set_xdg_app_id("babry").map_err(|error| error.to_string())?;
     attach_startup_trace(&app);
     let controller = EditorController::install(&app, Arc::new(RgbaImage::new(1, 1)));
@@ -362,7 +371,7 @@ fn run_daemon() -> Result<(), String> {
                         thread::Builder::new()
                             .name("babry-capture".into())
                             .spawn(move || {
-                                let result = capture_source(output, "daemon-ppm");
+                                let result = capture_source(output, "daemon");
                                 let completed_busy = worker_busy.clone();
                                 if slint::invoke_from_event_loop(move || {
                                     DAEMON_RUNTIME.with(|runtime| {
@@ -371,8 +380,11 @@ fn run_daemon() -> Result<(), String> {
                                             completed_busy.store(false, Ordering::Release);
                                             return;
                                         };
-                                        let result =
-                                            result.and_then(|(base, output_name, trace)| {
+                                        let result = result.and_then(
+                                            |(base, output_name, trace, backend)| {
+                                                if backend == Backend::Kde {
+                                                    runtime.app.window().set_fullscreen(true);
+                                                }
                                                 configure_editor(
                                                     &runtime.app,
                                                     runtime.controller.clone(),
@@ -382,7 +394,8 @@ fn run_daemon() -> Result<(), String> {
                                                     trace,
                                                     save_dir,
                                                 )
-                                            });
+                                            },
+                                        );
                                         if let Err(error) = result {
                                             eprintln!("babry daemon: {error}");
                                             capture::notify(&error);

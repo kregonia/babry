@@ -51,6 +51,45 @@ enum ResizeEdge {
     BottomRight,
 }
 
+/// niri 的隐式鼠标抓取固定在按下时的表面坐标；KWin/Hyprland 使用移动后的表面坐标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerCoordinates {
+    Grab,
+    Surface,
+}
+
+impl PointerCoordinates {
+    fn for_backend(backend: Option<compositor::Backend>) -> Self {
+        if backend == Some(compositor::Backend::Niri) {
+            Self::Grab
+        } else {
+            Self::Surface
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PinDrag {
+    grab: (f64, f64),
+    geometry: (i32, i32, u32, u32),
+    edge: Option<ResizeEdge>,
+    coordinates: PointerCoordinates,
+}
+
+impl PinDrag {
+    fn delta(&self, position: (f64, f64), current_origin: (i32, i32)) -> (f64, f64) {
+        let (press_x, press_y, ..) = self.geometry;
+        let (origin_x, origin_y) = match self.coordinates {
+            PointerCoordinates::Grab => (press_x, press_y),
+            PointerCoordinates::Surface => current_origin,
+        };
+        (
+            f64::from(origin_x) + position.0 - f64::from(press_x) - self.grab.0,
+            f64::from(origin_y) + position.1 - f64::from(press_y) - self.grab.1,
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct OutputMetrics {
     width: u32,
@@ -181,9 +220,8 @@ fn create_pin(
         zoom: 1.0,
         x,
         y,
-        dragging: false,
-        resizing: None,
-        last_pointer: None,
+        drag: None,
+        pointer_coordinates: PointerCoordinates::for_backend(compositor::Backend::detect().ok()),
         first_configure: true,
         pending_redraw: true,
         exit: false,
@@ -214,9 +252,8 @@ struct PinSurface {
     zoom: f32,
     x: i32,
     y: i32,
-    dragging: bool,
-    resizing: Option<ResizeEdge>,
-    last_pointer: Option<(f64, f64)>,
+    drag: Option<PinDrag>,
+    pointer_coordinates: PointerCoordinates,
     first_configure: bool,
     pending_redraw: bool,
     exit: bool,
@@ -250,7 +287,7 @@ impl PinSurface {
             )
             .map_err(|error| format!("无法创建贴图缓冲区: {error}"))?;
 
-        for (pixel, chunk) in image.pixels().zip(canvas.chunks_exact_mut(4)) {
+        for (pixel, chunk) in image.pixels().zip(canvas.as_chunks_mut::<4>().0) {
             // Wayland ARGB8888 使用预乘 alpha；截图通常不透明，也支持透明 PNG。
             let alpha = u16::from(pixel[3]);
             chunk.copy_from_slice(&[
@@ -276,11 +313,16 @@ impl PinSurface {
         Ok(())
     }
 
-    fn move_by(&mut self, dx: f64, dy: f64) {
+    fn move_to(&mut self, x: f64, y: f64) {
         let max_x = self.screen_width.saturating_sub(self.display_size.0) as i32;
         let max_y = self.screen_height.saturating_sub(self.display_size.1) as i32;
-        self.x = (self.x + dx.round() as i32).clamp(0, max_x);
-        self.y = (self.y + dy.round() as i32).clamp(0, max_y);
+        let x = (x.round() as i32).clamp(0, max_x);
+        let y = (y.round() as i32).clamp(0, max_y);
+        if (x, y) == (self.x, self.y) {
+            return;
+        }
+        self.x = x;
+        self.y = y;
         self.layer.set_margin(self.y, 0, 0, self.x);
         self.layer.commit();
     }
@@ -311,23 +353,46 @@ fn resize_edge_at(position: (f64, f64), width_px: u32, height_px: u32) -> Option
 }
 
 impl PinSurface {
-    fn resize_by(&mut self, edge: ResizeEdge, dx: f64, dy: f64) {
-        let old_width = self.display_size.0 as f64;
-        let old_height = self.display_size.1 as f64;
+    fn apply_pointer_motion(&mut self, position: (f64, f64)) {
+        let Some(drag) = self.drag else { return };
+        let (dx, dy) = drag.delta(position, (self.x, self.y));
+        if let Some(edge) = drag.edge {
+            self.resize_from_press(drag.geometry, edge, dx, dy);
+        } else {
+            self.move_to(
+                f64::from(drag.geometry.0) + dx,
+                f64::from(drag.geometry.1) + dy,
+            );
+        }
+    }
+
+    /// 从按下时的几何出发应用缩放总量，保证拖动反向时不残留累计误差。
+    fn resize_from_press(
+        &mut self,
+        geometry: (i32, i32, u32, u32),
+        edge: ResizeEdge,
+        total_dx: f64,
+        total_dy: f64,
+    ) {
+        let (press_x, press_y, press_width, press_height) = geometry;
+        let old_width = press_width as f64;
+        let old_height = press_height as f64;
         let (mut left, mut top, mut right, mut bottom) = (
-            self.x as f64,
-            self.y as f64,
-            self.x as f64 + old_width,
-            self.y as f64 + old_height,
+            press_x as f64,
+            press_y as f64,
+            press_x as f64 + old_width,
+            press_y as f64 + old_height,
         );
         match edge {
-            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => left += dx,
-            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => right += dx,
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => left += total_dx,
+            ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => right += total_dx,
             _ => {}
         }
         match edge {
-            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => top += dy,
-            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => bottom += dy,
+            ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => top += total_dy,
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+                bottom += total_dy
+            }
             _ => {}
         }
         let min = MIN_PIN_SIZE as f64;
@@ -355,8 +420,13 @@ impl PinSurface {
         let height = ((bottom - top).round().max(min) as u32).min(self.screen_height);
         let max_x = self.screen_width.saturating_sub(width) as i32;
         let max_y = self.screen_height.saturating_sub(height) as i32;
-        self.x = (left.round() as i32).clamp(0, max_x);
-        self.y = (top.round() as i32).clamp(0, max_y);
+        let x = (left.round() as i32).clamp(0, max_x);
+        let y = (top.round() as i32).clamp(0, max_y);
+        if (x, y, width, height) == (self.x, self.y, self.display_size.0, self.display_size.1) {
+            return;
+        }
+        self.x = x;
+        self.y = y;
         self.apply_size(width, height);
     }
 
@@ -673,37 +743,43 @@ impl PointerHandler for PinSurface {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
+        self.handle_pointer_events(events);
+    }
+}
+
+impl PinSurface {
+    fn handle_pointer_events(&mut self, events: &[PointerEvent]) {
         let mut zoom_factor = 1.0;
+        // 连续 motion 只提交最后一次；按键边界前先应用，不能丢掉松手所在帧的末次移动。
+        let mut last_motion: Option<(f64, f64)> = None;
 
         for event in events {
             if &event.surface != self.layer.wl_surface() {
                 continue;
             }
             match event.kind {
-                PointerEventKind::Motion { .. } if self.dragging || self.resizing.is_some() => {
-                    if let Some(last) = self.last_pointer {
-                        let dx = event.position.0 - last.0;
-                        let dy = event.position.1 - last.1;
-                        if let Some(edge) = self.resizing {
-                            self.resize_by(edge, dx, dy);
-                        } else {
-                            self.move_by(dx, dy);
-                        }
-                    }
-                    self.last_pointer = Some(event.position);
+                PointerEventKind::Motion { .. } if self.drag.is_some() => {
+                    last_motion = Some(event.position);
                 }
                 PointerEventKind::Press { button, .. } if button == LEFT_BUTTON => {
-                    self.resizing = self.resize_edge_at(event.position);
-                    self.dragging = self.resizing.is_none();
-                    self.last_pointer = Some(event.position);
+                    if let Some(position) = last_motion.take() {
+                        self.apply_pointer_motion(position);
+                    }
+                    self.drag = Some(PinDrag {
+                        grab: event.position,
+                        geometry: (self.x, self.y, self.display_size.0, self.display_size.1),
+                        edge: self.resize_edge_at(event.position),
+                        coordinates: self.pointer_coordinates,
+                    });
                 }
                 PointerEventKind::Press { button, .. } if button == RIGHT_BUTTON => {
                     self.exit = true;
                 }
                 PointerEventKind::Release { button, .. } if button == LEFT_BUTTON => {
-                    self.dragging = false;
-                    self.resizing = None;
-                    self.last_pointer = None;
+                    if let Some(position) = last_motion.take() {
+                        self.apply_pointer_motion(position);
+                    }
+                    self.drag = None;
                 }
                 PointerEventKind::Axis { vertical, .. } if !vertical.is_none() => {
                     let delta = if vertical.value120 != 0 {
@@ -715,6 +791,10 @@ impl PointerHandler for PinSurface {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(position) = last_motion {
+            self.apply_pointer_motion(position);
         }
 
         if zoom_factor != 1.0 {
@@ -759,6 +839,38 @@ mod tests {
     }
 
     #[test]
+    fn drag_coordinates_follow_backend_and_ignore_replayed_motion() {
+        for backend in [
+            compositor::Backend::Niri,
+            compositor::Backend::Kde,
+            compositor::Backend::Hyprland,
+        ] {
+            let drag = PinDrag {
+                grab: (200.0, 140.0),
+                geometry: (824, 436, 400, 280),
+                edge: None,
+                coordinates: PointerCoordinates::for_backend(Some(backend)),
+            };
+            assert_eq!(drag.delta((280.0, 190.0), (824, 436)), (80.0, 50.0));
+            // niri 抓取期间重复原位置；KWin/Hyprland 把位置换算到已移动的表面。
+            let replay = if backend == compositor::Backend::Niri {
+                (280.0, 190.0)
+            } else {
+                (200.0, 140.0)
+            };
+            for _ in 0..8 {
+                assert_eq!(drag.delta(replay, (904, 486)), (80.0, 50.0));
+            }
+            let reverse = if backend == compositor::Backend::Niri {
+                (230.0, 160.0)
+            } else {
+                (150.0, 110.0)
+            };
+            assert_eq!(drag.delta(reverse, (904, 486)), (30.0, 20.0));
+        }
+    }
+
+    #[test]
     #[ignore = "requires a live Wayland session with layer-shell and viewporter"]
     fn viewport_resize_reuses_one_buffer_and_releases_source_pixels() {
         use smithay_client_toolkit::reexports::client::Proxy;
@@ -788,6 +900,148 @@ mod tests {
             assert!(pin.source.is_none());
             assert!(pin.display.is_none());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a live Wayland session with layer-shell and viewporter"]
+    fn pointer_frames_preserve_release_motion_and_all_resize_edges() {
+        use smithay_client_toolkit::reexports::client::Proxy;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pointer.png");
+        RgbaImage::from_pixel(400, 300, image::Rgba([30, 120, 200, 255]))
+            .save(&path)
+            .unwrap();
+        let (mut pin, mut queue) = create_pin(&path, None).unwrap();
+        for _ in 0..8 {
+            queue.roundtrip(&mut pin).unwrap();
+            if pin.buffer.is_some() {
+                break;
+            }
+        }
+        assert!(pin.viewport.is_some());
+        // 几何算法不依赖宿主输出大小，低分辨率测试会话也使用相同的边界场景。
+        pin.screen_width = 1920;
+        pin.screen_height = 1080;
+        let buffer = pin.buffer.as_ref().unwrap().wl_buffer().id();
+        let surface = pin.layer.wl_surface().clone();
+        let motion = |position| PointerEvent {
+            surface: surface.clone(),
+            position,
+            kind: PointerEventKind::Motion { time: 1 },
+        };
+        let button = |position, pressed| PointerEvent {
+            surface: surface.clone(),
+            position,
+            kind: if pressed {
+                PointerEventKind::Press {
+                    time: 1,
+                    button: LEFT_BUTTON,
+                    serial: 1,
+                }
+            } else {
+                PointerEventKind::Release {
+                    time: 1,
+                    button: LEFT_BUTTON,
+                    serial: 1,
+                }
+            },
+        };
+        for coordinates in [PointerCoordinates::Grab, PointerCoordinates::Surface] {
+            pin.pointer_coordinates = coordinates;
+            pin.x = 500;
+            pin.y = 300;
+            pin.apply_size(400, 300);
+            pin.handle_pointer_events(&[button((200.0, 150.0), true)]);
+            pin.handle_pointer_events(&[motion((280.0, 200.0))]);
+            assert_eq!((pin.x, pin.y), (580, 350));
+            let stationary = if coordinates == PointerCoordinates::Grab {
+                (280.0, 200.0)
+            } else {
+                (200.0, 150.0)
+            };
+            for _ in 0..8 {
+                pin.handle_pointer_events(&[motion(stationary)]);
+                assert_eq!((pin.x, pin.y), (580, 350), "stationary pointer drifted");
+            }
+            let final_position = if coordinates == PointerCoordinates::Grab {
+                (300.0, 215.0)
+            } else {
+                (220.0, 165.0)
+            };
+            // 多次移动与松手可以同帧到达，必须先提交末次移动再清理抓取状态。
+            pin.handle_pointer_events(&[
+                motion(stationary),
+                motion(final_position),
+                button(final_position, false),
+            ]);
+            assert_eq!((pin.x, pin.y), (600, 365));
+            assert!(pin.drag.is_none());
+            pin.handle_pointer_events(&[motion((0.0, 0.0))]);
+            assert_eq!((pin.x, pin.y), (600, 365));
+            for (grab, delta, expected) in [
+                ((2.0, 150.0), (-40.0, 0.0), (460, 300, 440, 300)),
+                ((398.0, 150.0), (40.0, 0.0), (500, 300, 440, 300)),
+                ((200.0, 2.0), (0.0, -30.0), (500, 270, 400, 330)),
+                ((200.0, 298.0), (0.0, 30.0), (500, 300, 400, 330)),
+                ((2.0, 2.0), (-40.0, -30.0), (460, 270, 440, 330)),
+                ((398.0, 2.0), (40.0, -30.0), (500, 270, 440, 330)),
+                ((2.0, 298.0), (-40.0, 30.0), (460, 300, 440, 330)),
+                ((398.0, 298.0), (40.0, 30.0), (500, 300, 440, 330)),
+            ] {
+                pin.x = 500;
+                pin.y = 300;
+                pin.apply_size(400, 300);
+                pin.handle_pointer_events(&[button(grab, true)]);
+                let position = (grab.0 + delta.0, grab.1 + delta.1);
+                pin.handle_pointer_events(&[motion(position)]);
+                let stationary = if coordinates == PointerCoordinates::Grab {
+                    position
+                } else {
+                    (
+                        position.0 - f64::from(pin.x - 500),
+                        position.1 - f64::from(pin.y - 300),
+                    )
+                };
+                for _ in 0..8 {
+                    pin.handle_pointer_events(&[motion(stationary)]);
+                    assert_eq!(
+                        (pin.x, pin.y, pin.display_size.0, pin.display_size.1),
+                        expected
+                    );
+                }
+                // 反向回到按下位置，边界钳制或历史几何不能残留在新尺寸里。
+                let reverse = if coordinates == PointerCoordinates::Grab {
+                    grab
+                } else {
+                    (
+                        grab.0 - f64::from(pin.x - 500),
+                        grab.1 - f64::from(pin.y - 300),
+                    )
+                };
+                pin.handle_pointer_events(&[motion(reverse), button(reverse, false)]);
+                assert_eq!(
+                    (pin.x, pin.y, pin.display_size.0, pin.display_size.1),
+                    (500, 300, 400, 300)
+                );
+            }
+            // 夹到屏幕边缘后再反向，使用按下总量而不是已截断的累计位移。
+            pin.x = 500;
+            pin.y = 300;
+            pin.apply_size(400, 300);
+            pin.handle_pointer_events(&[button((200.0, 150.0), true)]);
+            pin.handle_pointer_events(&[motion((-900.0, -900.0))]);
+            assert_eq!((pin.x, pin.y), (0, 0));
+            let reverse = if coordinates == PointerCoordinates::Grab {
+                (230.0, 170.0)
+            } else {
+                (730.0, 470.0)
+            };
+            pin.handle_pointer_events(&[motion(reverse), button(reverse, false)]);
+            assert_eq!((pin.x, pin.y), (530, 320));
+        }
+        queue.roundtrip(&mut pin).unwrap();
+        assert_eq!(pin.buffer.as_ref().unwrap().wl_buffer().id(), buffer);
+        assert!(pin.source.is_none() && pin.display.is_none());
     }
 
     #[test]

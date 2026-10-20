@@ -1,3 +1,9 @@
+mod grim;
+mod hyprland;
+mod kde;
+mod niri;
+
+use image::RgbaImage;
 use serde_json::Value;
 use std::process::Command;
 
@@ -13,10 +19,17 @@ pub struct OutputInfo {
     pub focused: bool,
 }
 
+/// 合成器的截屏与输出枚举接口；每个后端实现该 trait，由 Backend 负责选择。
+pub trait Compositor {
+    fn outputs(&self) -> Result<Vec<OutputInfo>, String>;
+    fn capture(&self, output: &str) -> Result<RgbaImage, String>;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Niri,
     Hyprland,
+    Kde,
 }
 
 impl Backend {
@@ -24,25 +37,37 @@ impl Backend {
         let desktop = std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() || desktop.contains("hypr") {
-            Ok(Self::Hyprland)
-        } else if std::env::var_os("NIRI_SOCKET").is_some() || desktop.contains("niri") {
-            Ok(Self::Niri)
-        } else {
-            Err("当前仅支持 niri 和 Hyprland 会话".into())
+        detect_from(
+            &desktop,
+            std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+            std::env::var_os("NIRI_SOCKET").is_some(),
+            std::env::var_os("KDE_FULL_SESSION").is_some(),
+        )
+    }
+
+    pub fn compositor(self) -> Box<dyn Compositor> {
+        match self {
+            Self::Niri => Box::new(niri::Niri),
+            Self::Hyprland => Box::new(hyprland::Hyprland),
+            Self::Kde => Box::new(kde::Kde),
         }
     }
 }
 
+fn detect_from(desktop: &str, hyprland: bool, niri: bool, kde: bool) -> Result<Backend, String> {
+    if hyprland || desktop.contains("hypr") {
+        Ok(Backend::Hyprland)
+    } else if niri || desktop.contains("niri") {
+        Ok(Backend::Niri)
+    } else if kde || desktop.contains("kde") || desktop.contains("plasma") {
+        Ok(Backend::Kde)
+    } else {
+        Err("当前仅支持 niri、Hyprland 和 KDE Plasma 6.8+ 会话".into())
+    }
+}
+
 pub fn outputs() -> Result<Vec<OutputInfo>, String> {
-    let result = match Backend::detect()? {
-        Backend::Niri => {
-            let value = command_json("niri", &["msg", "-j", "outputs"])?;
-            let focus = command_json("niri", &["msg", "-j", "focused-output"])?;
-            parse_niri(&value, focus.get("name").and_then(Value::as_str))?
-        }
-        Backend::Hyprland => parse_hyprland(&command_json("hyprctl", &["-j", "monitors"])?)?,
-    };
+    let result = Backend::detect()?.compositor().outputs()?;
     if result.is_empty() {
         Err("没有启用的显示器".into())
     } else {
@@ -74,71 +99,6 @@ impl OutputInfo {
             && x < f64::from(self.x) + f64::from(self.width)
             && y < f64::from(self.y) + f64::from(self.height)
     }
-}
-
-fn parse_niri(value: &Value, focused: Option<&str>) -> Result<Vec<OutputInfo>, String> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| "niri 输出格式无效".to_string())?;
-    object
-        .iter()
-        .filter(|(_, output)| output.get("logical").is_some_and(|v| !v.is_null()))
-        .map(|(name, output)| {
-            let logical = &output["logical"];
-            let info = OutputInfo {
-                name: name.clone(),
-                x: integer(logical, "x")?,
-                y: integer(logical, "y")?,
-                width: positive_size(logical, "width")?,
-                height: positive_size(logical, "height")?,
-                scale: scale(logical)?,
-                focused: focused == Some(name.as_str()),
-            };
-            Ok(info)
-        })
-        .collect()
-}
-
-fn parse_hyprland(value: &Value) -> Result<Vec<OutputInfo>, String> {
-    let array = value
-        .as_array()
-        .ok_or_else(|| "Hyprland 输出格式无效".to_string())?;
-    array
-        .iter()
-        .filter(|monitor| monitor.get("disabled").and_then(Value::as_bool) != Some(true))
-        .map(|monitor| {
-            let scale = scale(monitor)?;
-            let mut width = positive_size(monitor, "width")?;
-            let mut height = positive_size(monitor, "height")?;
-            let transform = monitor
-                .get("transform")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if transform > 7 {
-                return Err("Hyprland 输出旋转值无效".into());
-            }
-            if transform % 2 == 1 {
-                std::mem::swap(&mut width, &mut height);
-            }
-            Ok(OutputInfo {
-                name: monitor
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .filter(|n| !n.is_empty())
-                    .ok_or_else(|| "Hyprland 输出缺少名称".to_string())?
-                    .to_string(),
-                x: integer(monitor, "x")?,
-                y: integer(monitor, "y")?,
-                width: (width as f64 / f64::from(scale)).round().max(1.0) as u32,
-                height: (height as f64 / f64::from(scale)).round().max(1.0) as u32,
-                scale,
-                focused: monitor
-                    .get("focused")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })
-        .collect()
 }
 
 fn integer(object: &Value, key: &str) -> Result<i32, String> {
@@ -181,30 +141,53 @@ fn command_json(program: &str, args: &[&str]) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn niri_uses_logical_geometry_and_skips_disabled_outputs() {
-        let value = serde_json::json!({"DP-1":{"logical":{"x":-2048,"y":0,"width":2048,"height":1152,"scale":1.25}},"DP-2":{"logical":null},"HDMI-A-1":{"logical":{"x":0,"y":0,"width":1920,"height":1080,"scale":1}}});
-        let outputs = parse_niri(&value, Some("HDMI-A-1")).unwrap();
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(select_output(&outputs, None).unwrap().name, "HDMI-A-1");
-        assert!(
-            select_output(&outputs, Some("DP-1"))
-                .unwrap()
-                .contains(-100.0, 500.0)
+    fn backend_detection_covers_supported_sessions() {
+        assert_eq!(
+            detect_from("hyprland", false, false, false).unwrap(),
+            Backend::Hyprland
         );
-        assert!(select_output(&outputs, Some("DP-2")).is_err());
+        assert_eq!(
+            detect_from("niri", false, false, false).unwrap(),
+            Backend::Niri
+        );
+        assert_eq!(
+            detect_from("kde", false, false, false).unwrap(),
+            Backend::Kde
+        );
+        assert_eq!(
+            detect_from("plasma", false, false, false).unwrap(),
+            Backend::Kde
+        );
+        assert_eq!(detect_from("", false, false, true).unwrap(), Backend::Kde);
+        assert!(detect_from("gnome", false, false, false).is_err());
     }
+
     #[test]
-    fn hyprland_converts_rotated_fractional_output_to_logical_units() {
-        let value = serde_json::json!([{ "name":"DP-1","x":-1152,"y":0,"width":2560,"height":1440,"scale":1.25,"transform":1,"focused":true }]);
-        let output = parse_hyprland(&value).unwrap().remove(0);
-        assert_eq!((output.width, output.height), (1152, 2048));
-        assert_eq!(output.scale, 1.25);
-        assert!(output.focused);
-    }
-    #[test]
-    fn malformed_geometry_is_rejected() {
-        assert!(parse_hyprland(&serde_json::json!([{"name":"DP-1","x":0,"y":0,"width":1920,"height":1080,"scale":0}])).is_err());
-        assert!(parse_niri(&serde_json::json!({"DP-1":{"logical":{"x":0,"y":0,"width":-1,"height":1080,"scale":1}}}),None).is_err());
+    fn select_output_prefers_focused_then_first() {
+        let outputs = vec![
+            OutputInfo {
+                name: "DP-1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale: 1.0,
+                focused: false,
+            },
+            OutputInfo {
+                name: "DP-2".into(),
+                x: 1920,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                scale: 1.25,
+                focused: true,
+            },
+        ];
+        assert_eq!(select_output(&outputs, None).unwrap().name, "DP-2");
+        assert_eq!(select_output(&outputs, Some("DP-1")).unwrap().name, "DP-1");
+        assert!(select_output(&outputs, Some("HDMI-A-1")).is_err());
     }
 }

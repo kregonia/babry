@@ -1,6 +1,6 @@
 [package]
 name = "babry"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ tempfile = "3"
 serde_json = "1"
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }
 smithay-client-toolkit = "0.20"
+zbus = "5"
 
 [build-dependencies]
 slint-build = "1.17"
