@@ -4,7 +4,7 @@
 //! only a Unix-socket launcher: it does not initialize Wayland while idle.
 
 use babry::{
-    cli, config, kde,
+    cli, compositor, config, kde,
     marks::{self, Mark},
     native_pin,
     pixels::{self, PixelSize, PixelTarget, RgbaPixels, RgbaViewMut},
@@ -76,14 +76,15 @@ fn dispatch(command: cli::Command) -> Result<(), String> {
         cli::Command::Daemon => run_daemon(),
         cli::Command::DaemonStatus => daemon_status(),
         cli::Command::StopDaemon => stop_daemon(),
-        cli::Command::Pin(path) => native_pin(&path),
-        cli::Command::PinSurface(path) => native_pin(&path),
+        cli::Command::Pin(path) => native_pin(&path, None),
+        cli::Command::PinSurface(path) => native_pin(&path, None),
         cli::Command::Region => capture_or_forward(false, None, None),
         cli::Command::Screen => capture_or_forward(true, None, None),
         cli::Command::OnOutput { command, name } => match *command {
             cli::Command::Region => capture_or_forward(false, Some(name), None),
             cli::Command::Screen => capture_or_forward(true, Some(name), None),
-            cli::Command::Pin(path) | cli::Command::PinSurface(path) => native_pin(&path),
+            cli::Command::Pin(path) => native_pin(&path, Some(name)),
+            cli::Command::PinSurface(path) => native_pin(&path, Some(name)),
             _ => Err("--output 组合无效".into()),
         },
         cli::Command::Standalone(command) => dispatch_standalone(*command, None),
@@ -145,29 +146,45 @@ fn capture_session(
     output: Option<String>,
     save_dir: Option<PathBuf>,
 ) -> Result<(), String> {
-    let source = match screencopy::capture(output.as_deref()) {
-        Ok(frame) => frame.pixels,
-        Err(error) => {
-            let name = kde::active_output().map_err(|_| error.clone())?;
-            kde::capture(&name).map_err(|_| error)?
-        }
+    let outputs = compositor::outputs()?;
+    let selected = compositor::select_output(&outputs, output.as_deref())?;
+    let (source, logical_width, logical_height) = match screencopy::capture(Some(&selected.name)) {
+        Ok(frame) => (frame.pixels, selected.width, selected.height),
+        Err(error) if compositor::Backend::detect()? == compositor::Backend::Kde => (
+            kde::capture(&selected.name).map_err(|_| error)?,
+            selected.width,
+            selected.height,
+        ),
+        Err(error) => return Err(error),
     };
     let directory = config::resolve_save_dir(save_dir.as_deref())?;
-    NativeEditor::run(source, direct_edit, directory)
+    NativeEditor::run(
+        source,
+        direct_edit,
+        directory,
+        logical_width,
+        logical_height,
+    )
 }
 
 fn list_outputs() -> Result<(), String> {
-    let source = screencopy::capture(None)?;
-    println!(
-        "当前焦点输出: {}x{}",
-        source.pixels.width(),
-        source.pixels.height()
-    );
+    for output in compositor::outputs()? {
+        println!(
+            "{}: {}x{} at ({}, {}) scale {}{}",
+            output.name,
+            output.width,
+            output.height,
+            output.x,
+            output.y,
+            output.scale,
+            if output.focused { " [focused]" } else { "" }
+        );
+    }
     Ok(())
 }
 
-fn native_pin(path: &Path) -> Result<(), String> {
-    native_pin::run_surface(path, None)
+fn native_pin(path: &Path, output: Option<String>) -> Result<(), String> {
+    native_pin::run_surface(path, output)
 }
 
 fn daemon_status() -> Result<(), String> {
@@ -286,7 +303,13 @@ struct NativeEditor {
 }
 
 impl NativeEditor {
-    fn run(source: RgbaPixels, direct_edit: bool, save_dir: PathBuf) -> Result<(), String> {
+    fn run(
+        source: RgbaPixels,
+        direct_edit: bool,
+        save_dir: PathBuf,
+        logical_width: u32,
+        logical_height: u32,
+    ) -> Result<(), String> {
         let connection =
             Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
         let (globals, mut queue) = registry_queue_init::<NativeEditor>(&connection)
@@ -299,8 +322,6 @@ impl NativeEditor {
         let shm = Shm::bind(&globals, &qh).map_err(|error| format!("wl_shm 不可用: {error}"))?;
         let width = source.width();
         let height = source.height();
-        let logical_width = (width as f32 / 1.25).round() as u32;
-        let logical_height = (height as f32 / 1.25).round() as u32;
         let surface = compositor.create_surface(&qh);
         let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
         let viewport = viewporter
@@ -562,7 +583,6 @@ impl KeyboardHandler for NativeEditor {
         _: u32,
         event: KeyEvent,
     ) {
-        eprintln!("native key {:?} ctrl={}", event.keysym, self.modifiers.ctrl);
         if event.keysym == Keysym::Control_L || event.keysym == Keysym::Control_R {
             self.control_down = true;
         }

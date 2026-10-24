@@ -42,7 +42,7 @@
 - 在同一个界面完成标注、文字、复制、保存和贴图。
 
 > [!NOTE]
-> Babry 当前支持 Linux Wayland 下的 niri、Hyprland 和 KDE Plasma 6.8+。CV 选区使用 Rust 的 `imageproc` 内置实现，不依赖 `slurp`、选区 IPC 或系统 OpenCV 动态库。
+> Babry 当前支持 Linux Wayland 下的 niri、Hyprland 和 KDE Plasma 6.8+。原生编辑器使用 SCTK、Layer-Shell 与 wl_shm；智能选区正在迁移到低内存流式检测器。
 
 ## 预览
 
@@ -80,7 +80,7 @@
 | **隐私处理** | 局部马赛克与连续轨迹模糊，可调节模糊度 |
 | **原位文字** | 直接在画布输入，多行换行；字号、字体和颜色与导出同步 |
 | **工作流** | 实时预览、撤销/重做、保存 PNG、复制到剪贴板、Wayland 贴图 |
-| **轻依赖** | Rust + Slint + imageproc；KDE 后端使用纯 Rust 的 zbus，不要求系统 OpenCV、slurp 或 niri 选区命令 |
+| **轻依赖** | Rust + SCTK + wl_shm；不要求 Slint、系统 OpenCV、slurp 或 niri 选区命令 |
 
 ## 快速开始
 
@@ -203,7 +203,7 @@ Hyprland 可加入：
 exec-once = babry --daemon
 ```
 
-常驻会保留 Slint 运行时、字体和部分系统/图形缓存，交换更低的唤起延迟。它不在空闲时循环截图或轮询鼠标，也不保存上一帧供下一次使用。Wayland 隐藏编辑窗口时，Slint 会销毁其原生窗口和图形上下文，后台不保证永久保留 GPU 资源。内存较少、截图较少时可以使用独立模式。
+常驻后台只监听 Unix socket；截图编辑会话按请求启动并在保存/取消后退出，因此不会在空闲状态初始化 Wayland surface、字体或绘图缓冲区。
 
 ## 交互方式
 
@@ -319,13 +319,13 @@ Wayland 桌面
   内存原图（PPM 管道 / 原始像素）
     │
     ▼
-  imageproc CV 检测器
+  原生流式 CV 检测器
     │
     ▼
-  Slint 选区交互层
+  SCTK Layer-Shell 选区交互层
     │
     ▼
-  Slint 标注编辑器
+  wl_shm CPU 标注编辑器
     │      │      │
     ▼      ▼      ▼
  PNG 保存  剪贴板  layer-shell 贴图
@@ -335,36 +335,22 @@ Wayland 桌面
 
 ```text
 src/
-├── capture.rs          # 通知与剪贴板
 ├── cli.rs              # 命令解析与帮助文本
-├── compositor.rs       # 合成器策略接口、后端检测与显示器选择
-├── compositor/
-│   ├── grim.rs         # grim PPM 管道（niri/Hyprland）
-│   ├── hyprland.rs     # Hyprland 输出枚举
-│   ├── kde.rs          # KDE Plasma 6.8+：KWin ScreenShot2 与输出枚举
-│   └── niri.rs         # niri 输出枚举
+├── compositor.rs       # 合成器检测、输出元数据与窗口锚点
 ├── config.rs           # 保存目录配置、路径展开与导出文件名
-├── daemon.rs           # 会话 Unix socket、实例锁和后台协议
-├── startup.rs          # 启动阶段计时与后台空闲内存回收
+├── daemon.rs           # 会话 Unix socket、实例锁和后台子进程
+├── font.rs             # 按需 mmap 字体与 ttf-parser 轮廓
+├── kde.rs              # 按需加载 sd-bus 的 KWin ScreenShot2
+├── marks.rs            # CPU 像素标注命令与基础光栅化
+├── native.rs           # memfd/wl_shm 共享内存基础设施
+├── native_pin.rs       # SCTK layer-shell Pin
+├── pixels.rs           # RGBA 像素、PPM/PNG 编码与裁剪
+├── screencopy.rs       # zwlr_screencopy SHM 捕获
 ├── core/
 │   ├── geometry.rs     # 像素几何与归一化坐标
 │   └── history.rs      # 撤销/重做历史
-├── editor.rs           # 标注模型、局部渲染、字体与导出
-├── document.rs         # 按需编辑画布、历史和局部预览
-├── controller.rs       # Slint 回调、帧合并和资源生命周期
-├── pin.rs              # Wayland layer-shell 贴图
-├── selection.rs        # 候选查询、父子层级与悬停状态
-├── selection/
-│   ├── detection.rs    # 多线索 CV 分析与原图边界精修
-│   ├── diagnostics.rs  # 候选可视化与评分 JSON
-│   └── tests.rs        # 弱边界、文字噪声、高分屏及真实截图回归
 ├── lib.rs              # 库模块导出
-└── main.rs             # 应用启动和工作流
-
-ui/
-├── app.slint           # 选区、输入、工具切换与菜单浮层
-├── toolbar.slint       # 可拖动工具栏、下拉入口和数值参数
-└── static/             # 工具栏 SVG 图标
+└── main.rs             # 原生 Layer-Shell 编辑器与工作流
 ```
 
 ## 开发者
@@ -383,7 +369,7 @@ cargo build --release --locked
 
 ### 启动性能定位
 
-交互截图在 niri/Hyprland 上使用 `grim -t ppm -o NAME -` 管道，在 KDE 上使用 ScreenShot2 返回的原始像素，二者都直接解码到内存，省去截图阶段的 PNG 压缩和临时文件。最终保存和复制仍导出 PNG。后台复用 Slint 界面、控制器和字体注册；耗时的截图/解码在线程中运行，CV 独立后台分析，旧任务的取消标记不会复用于新会话。
+niri/Hyprland 使用 `zwlr_screencopy_manager_v1` 直接写入 wl_shm；KDE 使用按需加载的 ScreenShot2 sd-bus 兼容层。编辑器直接绘制到 SCTK wl_shm 帧，最终保存使用 PNG 编码器。当前原生迁移仍在进行，尚未宣称捕获源与显示帧完全零拷贝。
 
 设置 `BABRY_TRACE_STARTUP=1` 后，stderr 会输出 JSON 阶段耗时：
 
@@ -393,24 +379,24 @@ BABRY_TRACE_STARTUP=1 babry --daemon
 # 在另一终端运行 babry 或 babry --screen
 ```
 
-`output` 为显示器查询完成，`capture-ready` 为截图管道及解码完成，`ui-prepared` 为像素上传准备完成，`first-render` 为 Slint 首次完成场景渲染。最后一项位于显示呈现之前，不等同于合成器显示完成，也不包含后台模式客户端进程启动和 IPC 之前的时间。软件渲染器等不支持渲染通知时会报告埋点不可用。不要把同一台已预热机器的测量视为所有低配设备的冷启动结果。
+原有 Slint 渲染埋点已随原生迁移移除；后续将使用 Wayland frame callback 和实际提交时间重新定义。不要把旧版本测量当作原生重构后的结果。
 
 ### 编辑性能与基准
 
-选区阶段不提前分配编辑画布；首次提交标注后只创建选区大小的画布。绘制预览按标注包围盒生成局部图像，多次输入合并到约 16ms 的刷新节奏；提交和重做增量绘制，撤销在选区内重建。导出复用内存原图或已提交画布，标注字体在首次文字输入时加载，并与 Slint 共用字体字节。
+原生编辑器使用 wl_shm 显示帧、显式 buffer release 生命周期和矢量标注命令；当前阶段仍在补齐智能选区、文字输入、撤销重做和多帧脏矩形重绘。不要把本阶段的基础实现当作最终性能结果。
 
 运行可重复的编辑热点基准：
 
 ```bash
-cargo run --release --locked --example editor_bench
+cargo test --release --locked --all-targets
 ```
 
 基准使用 4K 原图、960×540 选区，测量 120 次短自由笔预览和 20 次提交，输出耗时与 CPU 像素缓冲区大小。它不包含完整 UI 帧率、GPU 纹理或整个进程 RSS；大范围笔迹与全屏选区仍需要更多计算和内存。
 
-在提供 layer-shell / viewporter 的 Wayland 会话中，可手动运行 Pin 集成测试：
+当前原生重构的基础检查：
 
 ```bash
-cargo test --locked --lib pin::tests:: -- --ignored
+cargo test --locked --all-targets
 ```
 
 集成测试同时检查缩放复用缓冲区，以及重复指针事件、松手同帧的末次移动、四边四角缩放和边界反向拖动。niri 的隐式抓取坐标与 KWin 的表面局部坐标分别处理，避免表面移动回发事件造成贴图持续漂移；位置和尺寸未变化时不会重复提交。
