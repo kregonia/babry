@@ -128,6 +128,17 @@ impl CaptureState {
                 return;
             }
         };
+        buffer
+            .activate()
+            .map_err(|error| {
+                self.error = Some(format!("无法激活截图缓冲区: {error}"));
+                self.done = true;
+                error
+            })
+            .ok();
+        if self.done {
+            return;
+        }
         frame.copy(buffer.wl_buffer());
         self.pool = Some(pool);
         self.buffer = Some(buffer);
@@ -141,11 +152,11 @@ impl CaptureState {
             self.done = true;
             return;
         };
-        let Some(data) = buffer.canvas(pool) else {
-            self.error = Some("截图缓冲区仍被 Wayland 使用".into());
-            self.done = true;
-            return;
-        };
+        // The screencopy `ready` event guarantees that the compositor finished
+        // writing. raw_data_mut is safe here even before wl_buffer.release; we
+        // never reuse this buffer and drop it after copying the completed frame.
+        let slot = buffer.slot();
+        let data = pool.raw_data_mut(&slot);
         let size = match PixelSize::new(info.width, info.height) {
             Ok(size) => size,
             Err(error) => {
@@ -198,21 +209,6 @@ impl CaptureState {
         }
         self.image = Some(image);
         self.done = true;
-    }
-
-    fn try_finish(&mut self) {
-        if self.ready && !self.done {
-            // wl_buffer.release may arrive in a later dispatch than frame.ready.
-            // Only read the mmap once the compositor has released the buffer.
-            let released = self
-                .pool
-                .as_mut()
-                .and_then(|pool| self.buffer.as_ref().and_then(|buffer| buffer.canvas(pool)))
-                .is_some();
-            if released {
-                self.finish();
-            }
-        }
     }
 }
 
@@ -268,6 +264,7 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
             zwlr_screencopy_frame_v1::Event::BufferDone => state.allocate_and_copy(frame),
             zwlr_screencopy_frame_v1::Event::Ready { .. } => {
                 state.ready = true;
+                state.finish();
                 frame.destroy();
             }
             zwlr_screencopy_frame_v1::Event::Failed => {
@@ -326,7 +323,6 @@ pub fn capture(output_name: Option<&str>) -> Result<CapturedFrame, String> {
         queue
             .blocking_dispatch(&mut state)
             .map_err(|error| format!("screencopy 事件循环失败: {error}"))?;
-        state.try_finish();
     }
     state.error.map_or_else(
         || {

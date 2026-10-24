@@ -1,5 +1,5 @@
 //! 无依赖的标注命令和 CPU 像素光栅化。
-use crate::{core::RectPx, pixels::RgbaPixels};
+use crate::{core::RectPx, pixels::PixelTarget};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mark {
@@ -42,13 +42,13 @@ impl Mark {
     }
 }
 
-pub fn render_marks(image: &mut RgbaPixels, marks: &[Mark], origin: (i32, i32)) {
+pub fn render_marks<T: PixelTarget>(image: &mut T, marks: &[Mark], origin: (i32, i32)) {
     for mark in marks {
         render_mark(image, mark, origin);
     }
 }
 
-fn render_mark(image: &mut RgbaPixels, mark: &Mark, origin: (i32, i32)) {
+fn render_mark<T: PixelTarget>(image: &mut T, mark: &Mark, origin: (i32, i32)) {
     let translate = |p: (f32, f32)| (p.0 - origin.0 as f32, p.1 - origin.1 as f32);
     match mark.kind {
         1 | 7 => {
@@ -101,7 +101,13 @@ fn render_mark(image: &mut RgbaPixels, mark: &Mark, origin: (i32, i32)) {
     }
 }
 
-fn draw_segment(image: &mut RgbaPixels, a: (f32, f32), b: (f32, f32), color: [u8; 4], width: u32) {
+fn draw_segment<T: PixelTarget>(
+    image: &mut T,
+    a: (f32, f32),
+    b: (f32, f32),
+    color: [u8; 4],
+    width: u32,
+) {
     let distance = (b.0 - a.0).hypot(b.1 - a.1);
     let steps = distance.ceil().max(1.0) as u32;
     for i in 0..=steps {
@@ -114,7 +120,7 @@ fn draw_segment(image: &mut RgbaPixels, a: (f32, f32), b: (f32, f32), color: [u8
         );
     }
 }
-fn draw_disk(image: &mut RgbaPixels, center: (f32, f32), width: u32, color: [u8; 4]) {
+fn draw_disk<T: PixelTarget>(image: &mut T, center: (f32, f32), width: u32, color: [u8; 4]) {
     let r = (width as f32 / 2.0).max(0.5);
     let left = (center.0 - r).floor().max(0.0) as u32;
     let top = (center.1 - r).floor().max(0.0) as u32;
@@ -128,7 +134,7 @@ fn draw_disk(image: &mut RgbaPixels, center: (f32, f32), width: u32, color: [u8;
         }
     }
 }
-fn draw_circle(image: &mut RgbaPixels, c: (f32, f32), r: f32, color: [u8; 4], width: u32) {
+fn draw_circle<T: PixelTarget>(image: &mut T, c: (f32, f32), r: f32, color: [u8; 4], width: u32) {
     let steps = (r * std::f32::consts::TAU).ceil().max(16.0) as u32;
     for i in 0..steps {
         let a = i as f32 / steps as f32 * std::f32::consts::TAU;
@@ -136,7 +142,13 @@ fn draw_circle(image: &mut RgbaPixels, c: (f32, f32), r: f32, color: [u8; 4], wi
         draw_disk(image, p, width, color);
     }
 }
-fn draw_digit(image: &mut RgbaPixels, c: (f32, f32), number: u32, color: [u8; 4], width: u32) {
+fn draw_digit<T: PixelTarget>(
+    image: &mut T,
+    c: (f32, f32),
+    number: u32,
+    color: [u8; 4],
+    width: u32,
+) {
     let glyph = number % 10;
     let segments = [
         [true, true, true, true, true, true, false],
@@ -190,6 +202,7 @@ pub fn selection_rect(width: u32, height: u32, selection: (f32, f32, f32, f32)) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pixels::RgbaPixels;
     #[test]
     fn renders_strokes_without_extra_images() {
         let mut p = RgbaPixels::new(crate::pixels::PixelSize::new(32, 32).unwrap());

@@ -3,11 +3,20 @@
 //! The GUI path is an SCTK layer-shell surface backed by wl_shm. The daemon is
 //! only a Unix-socket launcher: it does not initialize Wayland while idle.
 
-use babry::{cli, config, native_pin, pixels, pixels::RgbaPixels, screencopy};
+use babry::{
+    cli, config, kde,
+    marks::{self, Mark},
+    native_pin,
+    pixels::{self, PixelSize, PixelTarget, RgbaPixels, RgbaViewMut},
+    screencopy,
+};
 use smithay_client_toolkit::reexports::client::{
-    Connection, QueueHandle,
+    Connection, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+};
+use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::{
+    wp_viewport, wp_viewporter,
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -136,9 +145,15 @@ fn capture_session(
     output: Option<String>,
     save_dir: Option<PathBuf>,
 ) -> Result<(), String> {
-    let source = screencopy::capture(output.as_deref())?;
+    let source = match screencopy::capture(output.as_deref()) {
+        Ok(frame) => frame.pixels,
+        Err(error) => {
+            let name = kde::active_output().map_err(|_| error.clone())?;
+            kde::capture(&name).map_err(|_| error)?
+        }
+    };
     let directory = config::resolve_save_dir(save_dir.as_deref())?;
-    NativeEditor::run(source.pixels, direct_edit, directory)
+    NativeEditor::run(source, direct_edit, directory)
 }
 
 fn list_outputs() -> Result<(), String> {
@@ -245,16 +260,24 @@ struct NativeEditor {
     shm: Shm,
     layer: LayerSurface,
     pool: SlotPool,
+    _viewport: Option<wp_viewport::WpViewport>,
+    _viewporter: Option<wp_viewporter::WpViewporter>,
     source: RgbaPixels,
-    frame: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    buffers: Vec<smithay_client_toolkit::shm::slot::Buffer>,
     width: u32,
     height: u32,
+    logical_width: u32,
+    logical_height: u32,
     selection: babry::core::RectPx,
+    marks: Vec<Mark>,
+    pending_mark: Option<Mark>,
+    active_tool: u8,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pressed: bool,
     drag_start: Option<(f64, f64)>,
     modifiers: Modifiers,
+    control_down: bool,
     direct_edit: bool,
     save_dir: PathBuf,
     first_configure: bool,
@@ -276,12 +299,22 @@ impl NativeEditor {
         let shm = Shm::bind(&globals, &qh).map_err(|error| format!("wl_shm 不可用: {error}"))?;
         let width = source.width();
         let height = source.height();
+        let logical_width = (width as f32 / 1.25).round() as u32;
+        let logical_height = (height as f32 / 1.25).round() as u32;
         let surface = compositor.create_surface(&qh);
+        let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
+        let viewport = viewporter
+            .as_ref()
+            .map(|manager| manager.get_viewport(&surface, &qh, ()));
+        if let Some(viewport) = &viewport {
+            viewport.set_source(0.0, 0.0, width as f64, height as f64);
+            viewport.set_destination(logical_width as i32, logical_height as i32);
+        }
         let layer = shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("babry"), None);
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.set_size(width, height);
+        layer.set_size(logical_width, logical_height);
         layer.commit();
         let pool = SlotPool::new(width as usize * height as usize * 4, &shm)
             .map_err(|error| format!("无法创建编辑共享内存: {error}"))?;
@@ -292,16 +325,24 @@ impl NativeEditor {
             shm,
             layer,
             pool,
+            _viewport: viewport,
+            _viewporter: viewporter,
             source,
-            frame: None,
+            buffers: Vec::new(),
             width,
             height,
+            logical_width,
+            logical_height,
             selection: babry::core::RectPx::new(0, 0, width, height),
+            marks: Vec::new(),
+            pending_mark: None,
+            active_tool: 0,
             pointer: None,
             keyboard: None,
             pressed: false,
             drag_start: None,
             modifiers: Modifiers::default(),
+            control_down: false,
             direct_edit,
             save_dir,
             first_configure: true,
@@ -317,18 +358,28 @@ impl NativeEditor {
     }
 
     fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        if !self.dirty && self.frame.is_some() {
+        if !self.dirty && !self.buffers.is_empty() {
             return Ok(());
         }
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(
-                self.width as i32,
-                self.height as i32,
-                self.width as i32 * 4,
-                wl_shm::Format::Argb8888,
-            )
-            .map_err(|error| format!("创建编辑帧失败: {error}"))?;
+        let index = self
+            .buffers
+            .iter()
+            .position(|buffer| buffer.canvas(&mut self.pool).is_some())
+            .unwrap_or_else(|| {
+                let (buffer, _) = self
+                    .pool
+                    .create_buffer(
+                        self.width as i32,
+                        self.height as i32,
+                        self.width as i32 * 4,
+                        wl_shm::Format::Argb8888,
+                    )
+                    .expect("editor buffer allocation");
+                self.buffers.push(buffer);
+                self.buffers.len() - 1
+            });
+        let buffer = &self.buffers[index];
+        let canvas = buffer.canvas(&mut self.pool).ok_or("编辑帧仍在使用")?;
         for (index, dst) in canvas.chunks_exact_mut(4).enumerate() {
             let x = index as u32 % self.width;
             let y = index as u32 / self.width;
@@ -347,10 +398,15 @@ impl NativeEditor {
                 source[3],
             ]);
         }
+        let mut view = RgbaViewMut::new(PixelSize::new(self.width, self.height)?, canvas)?;
+        marks::render_marks(&mut view, &self.marks, (0, 0));
+        if let Some(mark) = &self.pending_mark {
+            marks::render_marks(&mut view, std::slice::from_ref(mark), (0, 0));
+        }
+        draw_toolbar(&mut view, self.width, self.height, self.active_tool);
         buffer
             .attach_to(self.layer.wl_surface())
             .map_err(|error| format!("附加编辑帧失败: {error}"))?;
-        self.frame = Some(buffer);
         self.dirty = false;
         self.layer
             .wl_surface()
@@ -506,13 +562,17 @@ impl KeyboardHandler for NativeEditor {
         _: u32,
         event: KeyEvent,
     ) {
+        eprintln!("native key {:?} ctrl={}", event.keysym, self.modifiers.ctrl);
+        if event.keysym == Keysym::Control_L || event.keysym == Keysym::Control_R {
+            self.control_down = true;
+        }
         if event.keysym == Keysym::Escape {
             self.exit = true;
         }
-        if self.modifiers.ctrl && event.keysym == Keysym::s {
+        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::s {
             let _ = self.save();
         }
-        if self.modifiers.ctrl && event.keysym == Keysym::c {
+        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::c {
             let _ = self.copy();
         }
     }
@@ -531,8 +591,11 @@ impl KeyboardHandler for NativeEditor {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: KeyEvent,
+        event: KeyEvent,
     ) {
+        if event.keysym == Keysym::Control_L || event.keysym == Keysym::Control_R {
+            self.control_down = false;
+        }
     }
     fn update_modifiers(
         &mut self,
@@ -559,27 +622,55 @@ impl PointerHandler for NativeEditor {
             if event.surface != *self.layer.wl_surface() {
                 continue;
             }
+            let physical = (
+                event.position.0 * self.width as f64 / self.logical_width.max(1) as f64,
+                event.position.1 * self.height as f64 / self.logical_height.max(1) as f64,
+            );
             match event.kind {
                 PointerEventKind::Press { button: 0x110, .. } => {
+                    if let Some(tool) =
+                        toolbar_hit(event.position, self.logical_width, self.logical_height)
+                    {
+                        self.active_tool = tool;
+                        self.dirty = true;
+                        continue;
+                    }
                     self.pressed = true;
-                    self.drag_start = Some(event.position);
+                    self.drag_start = Some(physical);
+                    if self.direct_edit && self.active_tool != 0 {
+                        self.pending_mark = Some(Mark::new(
+                            self.active_tool,
+                            physical.0 as f32,
+                            physical.1 as f32,
+                            [255, 59, 48, 255],
+                            6,
+                        ));
+                    }
                 }
                 PointerEventKind::Release { button: 0x110, .. } => {
                     self.pressed = false;
                     self.drag_start = None;
+                    if let Some(mark) = self.pending_mark.take() {
+                        self.marks.push(mark);
+                        self.dirty = true;
+                    }
                 }
                 PointerEventKind::Motion { .. } if self.pressed => {
                     if let Some(start) = self.drag_start {
-                        let x = start.0.min(event.position.0).max(0.0) as u32;
-                        let y = start.1.min(event.position.1).max(0.0) as u32;
-                        let right = start.0.max(event.position.0).min(self.width as f64) as u32;
-                        let bottom = start.1.max(event.position.1).min(self.height as f64) as u32;
-                        self.selection = babry::core::RectPx::new(
-                            x as i32,
-                            y as i32,
-                            right.saturating_sub(x),
-                            bottom.saturating_sub(y),
-                        );
+                        if let Some(mark) = &mut self.pending_mark {
+                            mark.update(physical.0 as f32, physical.1 as f32);
+                        } else {
+                            let x = start.0.min(physical.0).max(0.0) as u32;
+                            let y = start.1.min(physical.1).max(0.0) as u32;
+                            let right = start.0.max(physical.0).min(self.width as f64) as u32;
+                            let bottom = start.1.max(physical.1).min(self.height as f64) as u32;
+                            self.selection = babry::core::RectPx::new(
+                                x as i32,
+                                y as i32,
+                                right.saturating_sub(x),
+                                bottom.saturating_sub(y),
+                            );
+                        }
                         self.dirty = true;
                     }
                 }
@@ -587,6 +678,36 @@ impl PointerHandler for NativeEditor {
             }
         }
         let _ = self.draw(qh);
+    }
+}
+fn toolbar_hit(position: (f64, f64), width: u32, height: u32) -> Option<u8> {
+    if position.1 < height as f64 - 60.0 || position.0 < width as f64 - 590.0 {
+        return None;
+    }
+    let index = ((position.0 - (width as f64 - 584.0)) / 36.0).floor() as usize;
+    [1, 2, 11, 7].get(index).copied()
+}
+fn draw_toolbar<T: PixelTarget>(view: &mut T, width: u32, height: u32, active: u8) {
+    let left = width.saturating_sub(600);
+    let top = height.saturating_sub(72);
+    for y in top..height {
+        for x in left..width {
+            if let Some(p) = view.pixel_mut(x, y) {
+                p.copy_from_slice(&[24, 31, 43, 235]);
+            }
+        }
+    }
+    for (i, tool) in [1u8, 2, 11, 7].iter().enumerate() {
+        let x = left + 16 + i as u32 * 36;
+        if *tool == active {
+            for y in top + 8..top + 48 {
+                for xx in x..x + 30 {
+                    if let Some(p) = view.pixel_mut(xx, y) {
+                        p.copy_from_slice(&[90, 75, 170, 255]);
+                    }
+                }
+            }
+        }
     }
 }
 impl LayerShellHandler for NativeEditor {
@@ -614,6 +735,8 @@ impl ShmHandler for NativeEditor {
 }
 
 delegate_compositor!(NativeEditor);
+delegate_noop!(NativeEditor: ignore wp_viewporter::WpViewporter);
+delegate_noop!(NativeEditor: ignore wp_viewport::WpViewport);
 delegate_output!(NativeEditor);
 delegate_shm!(NativeEditor);
 delegate_seat!(NativeEditor);
