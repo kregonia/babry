@@ -288,6 +288,8 @@ struct NativeEditor {
     selection: babry::core::RectPx,
     marks: Vec<Mark>,
     pending_mark: Option<Mark>,
+    undo_stack: Vec<Vec<Mark>>,
+    redo_stack: Vec<Vec<Mark>>,
     active_tool: u8,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -357,6 +359,8 @@ impl NativeEditor {
             selection: babry::core::RectPx::new(0, 0, width, height),
             marks: Vec::new(),
             pending_mark: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             active_tool: 0,
             pointer: None,
             keyboard: None,
@@ -439,27 +443,28 @@ impl NativeEditor {
         Ok(())
     }
 
-    fn save(&mut self) -> Result<(), String> {
+    fn export_pixels(&self) -> Result<RgbaPixels, String> {
         let rect = if self.direct_edit {
             babry::core::RectPx::new(0, 0, self.source.width(), self.source.height())
         } else {
             self.selection
         };
+        let mut image = self.source.crop(rect)?;
+        marks::render_marks(&mut image, &self.marks, (rect.x, rect.y));
+        Ok(image)
+    }
+
+    fn save(&mut self) -> Result<(), String> {
         let output = config::output_path(&self.save_dir)?;
-        pixels::write_png(&output, &self.source.crop(rect)?)?;
+        pixels::write_png(&output, &self.export_pixels()?)?;
         eprintln!("已保存: {}", output.display());
         self.exit = true;
         Ok(())
     }
 
     fn copy(&mut self) -> Result<(), String> {
-        let rect = if self.direct_edit {
-            babry::core::RectPx::new(0, 0, self.source.width(), self.source.height())
-        } else {
-            self.selection
-        };
         let output = config::output_path(&self.save_dir)?;
-        pixels::write_png(&output, &self.source.crop(rect)?)?;
+        pixels::write_png(&output, &self.export_pixels()?)?;
         let file = std::fs::File::open(&output).map_err(|error| error.to_string())?;
         let status = Command::new("wl-copy")
             .args(["--type", "image/png"])
@@ -471,6 +476,22 @@ impl NativeEditor {
         }
         self.exit = true;
         Ok(())
+    }
+
+    fn undo(&mut self) {
+        if let Some(previous) = self.undo_stack.pop() {
+            self.redo_stack.push(self.marks.clone());
+            self.marks = previous;
+            self.dirty = true;
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.marks.clone());
+            self.marks = next;
+            self.dirty = true;
+        }
     }
 }
 
@@ -595,6 +616,12 @@ impl KeyboardHandler for NativeEditor {
         if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::c {
             let _ = self.copy();
         }
+        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::z {
+            self.undo();
+        }
+        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::y {
+            self.redo();
+        }
     }
     fn repeat_key(
         &mut self,
@@ -648,11 +675,17 @@ impl PointerHandler for NativeEditor {
             );
             match event.kind {
                 PointerEventKind::Press { button: 0x110, .. } => {
-                    if let Some(tool) =
+                    if let Some(action) =
                         toolbar_hit(event.position, self.logical_width, self.logical_height)
                     {
-                        self.active_tool = tool;
-                        self.dirty = true;
+                        match action {
+                            3 => self.undo(),
+                            4 => self.redo(),
+                            tool => {
+                                self.active_tool = tool;
+                                self.dirty = true;
+                            }
+                        }
                         continue;
                     }
                     self.pressed = true;
@@ -671,6 +704,8 @@ impl PointerHandler for NativeEditor {
                     self.pressed = false;
                     self.drag_start = None;
                     if let Some(mark) = self.pending_mark.take() {
+                        self.undo_stack.push(self.marks.clone());
+                        self.redo_stack.clear();
                         self.marks.push(mark);
                         self.dirty = true;
                     }
@@ -705,7 +740,7 @@ fn toolbar_hit(position: (f64, f64), width: u32, height: u32) -> Option<u8> {
         return None;
     }
     let index = ((position.0 - (width as f64 - 584.0)) / 36.0).floor() as usize;
-    [1, 2, 11, 7].get(index).copied()
+    [1, 2, 11, 7, 3, 4].get(index).copied()
 }
 fn draw_toolbar<T: PixelTarget>(view: &mut T, width: u32, height: u32, active: u8) {
     let left = width.saturating_sub(600);
@@ -717,7 +752,7 @@ fn draw_toolbar<T: PixelTarget>(view: &mut T, width: u32, height: u32, active: u
             }
         }
     }
-    for (i, tool) in [1u8, 2, 11, 7].iter().enumerate() {
+    for (i, tool) in [1u8, 2, 11, 7, 3, 4].iter().enumerate() {
         let x = left + 16 + i as u32 * 36;
         if *tool == active {
             for y in top + 8..top + 48 {
