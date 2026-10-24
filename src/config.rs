@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// 每次截图请求读取配置，后台运行期间修改默认目录也能在下次唤起生效。
@@ -115,10 +116,38 @@ fn expand_path(path: &Path, home: Option<&Path>, base: &Path) -> Result<PathBuf,
 pub fn output_path(directory: &Path) -> Result<PathBuf, String> {
     fs::create_dir_all(directory)
         .map_err(|error| format!("无法创建保存目录 {}: {error}", directory.display()))?;
-    Ok(directory.join(format!(
-        "babry-{}.png",
-        chrono::Local::now().format("%Y%m%d-%H%M%S-%3f")
-    )))
+    Ok(directory.join(format!("babry-{}.png", timestamp_name())))
+}
+
+fn timestamp_name() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seconds = millis / 1000;
+    let day = seconds / 86_400;
+    let (year, month, date) = civil_date(day as i64);
+    let hour = (seconds / 3_600) % 24;
+    let minute = (seconds / 60) % 60;
+    let second = seconds % 60;
+    format!(
+        "{year:04}{month:02}{date:02}-{hour:02}{minute:02}{second:02}-{:03}",
+        millis % 1000
+    )
+}
+
+// Howard Hinnant's public-domain Gregorian civil-date conversion.
+fn civil_date(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 #[cfg(test)]

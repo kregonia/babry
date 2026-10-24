@@ -1,3 +1,3 @@
 fn main() {
-    slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
+    // The native editor is compiled directly from Rust and SCTK; no UI code generator is needed.
 }

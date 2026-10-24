@@ -4,22 +4,28 @@ version = "0.1.5"
 edition = "2024"
 
 [dependencies]
-ab_glyph = "0.2"
-chrono = "0.4"
-image = "0.25"
-imageproc = "0.25"
-slint = { version = "1.17", features = ["unstable-fontique-010"] }
-tempfile = "3"
+libc = "0.2"
+libloading = "0.8"
+memmap2 = "0.9"
+png = "0.18"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ttf-parser = "0.25"
 serde_json = "1"
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["xkbcommon"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }
-smithay-client-toolkit = "0.20"
-zbus = "5"
 
-[build-dependencies]
-slint-build = "1.17"
+[dev-dependencies]
+tempfile = "3"
 
 [profile.dev]
 opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
