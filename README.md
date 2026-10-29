@@ -42,7 +42,7 @@
 - 在同一个界面完成标注、文字、复制、保存和贴图。
 
 > [!NOTE]
-> Babry 当前支持 Linux Wayland 下的 niri、Hyprland 和 KDE Plasma 6.8+。原生编辑器使用 SCTK、Layer-Shell 与 wl_shm；智能选区正在迁移到低内存流式检测器。
+> Babry 当前支持 Linux Wayland 下的 niri、Hyprland 和 KDE Plasma 6.8+。原生编辑器使用 SCTK、Layer-Shell 与 wl_shm；截图像素只在共享内存中保留一份，同时用于显示和导出。
 
 ## 预览
 
@@ -74,13 +74,13 @@
 
 | 能力 | 体验 |
 | --- | --- |
-| **CV 智能选区** | 自适应边缘、颜色边界、背景连通域与长直线分析；质量评分、原图边界精修、滚轮切换层级 |
-| **全屏截图** | `grim`（niri/Hyprland）或 KWin 截屏接口（KDE Plasma 6.8+）获取当前 Wayland 桌面，`--screen` 直接进入编辑 |
+| **CV 智能选区** | 窗口几何吸附、纯色区域连通域与连续边框线分析；原图边界精修、滚轮切换父/子层级 |
+| **全屏截图** | `zwlr_screencopy`（niri/Hyprland）或 KWin 截屏接口（KDE Plasma 6.8+）获取当前 Wayland 桌面，`--screen` 直接进入编辑 |
 | **标注工具** | 画笔、矩形/圆形/方形、圈号递增数字标注、橡皮擦和半透明荧光笔 |
 | **隐私处理** | 局部马赛克与连续轨迹模糊，可调节模糊度 |
-| **原位文字** | 直接在画布输入，多行换行；字号、字体和颜色与导出同步 |
+| **原位文字** | 直接在画布输入，多行换行，支持 text-input-v3 输入法；字号、字体和颜色与导出同步 |
 | **工作流** | 实时预览、撤销/重做、保存 PNG、复制到剪贴板、Wayland 贴图 |
-| **轻依赖** | Rust + SCTK + wl_shm；不要求 Slint、系统 OpenCV、slurp 或 niri 选区命令 |
+| **轻依赖** | Rust + SCTK + wl_shm + tiny-skia；不需要 grim、Slint、系统 OpenCV、slurp 或 niri 选区命令 |
 
 ## 快速开始
 
@@ -123,15 +123,11 @@ install -Dm755 target/release/babry ~/.local/bin/babry
 
 ### 2. 安装运行依赖
 
-截图在 niri/Hyprland 上需要 `grim`；KDE Plasma 6.8+ 直接调用 KWin 自带的 `org.kde.KWin.ScreenShot2`，无需额外安装。复制图片需要 `wl-clipboard`；可选的 `notify-send` 用于状态通知。AUR 包已声明 Fontconfig、xkbcommon 和 Wayland 系统库依赖，截图和剪贴板工具请按需安装。
+截图由 Babry 直接通过 Wayland 协议完成：niri/Hyprland 使用 `zwlr_screencopy`，KDE Plasma 6.8+ 调用 KWin 自带的 `org.kde.KWin.ScreenShot2`，都不需要 `grim`。复制图片需要 `wl-clipboard`；可选的 `notify-send` 用于状态通知。AUR 包已声明 Fontconfig、xkbcommon 和 Wayland 系统库依赖。
 
 Arch Linux：
 
 ```bash
-# niri / Hyprland
-yay -S grim wl-clipboard libnotify
-
-# KDE Plasma 6.8+（无需 grim）
 yay -S wl-clipboard libnotify
 ```
 
@@ -232,17 +228,18 @@ CV 分析在每次截图时由后台线程执行一次，悬停不会重新处�
 - **预留功能**：更多入口暂空；折线以及尚未实现的长截图、录屏、OCR、翻译不显示在工具栏。
 - **文字**：选择 `字` 工具，在选区内点击即可原位输入。
 - **确认文字**：点击画布外、切换工具或按 `Ctrl+Enter`。
-- **取消文字**：`Esc`；未输入文字时，先取消当前绘制或选中工具，再次按 `Esc` 关闭截图。
+- **取消文字**：`Esc` 放弃正在输入的文字；不在输入时，`Esc` 依次关闭菜单、取消当前绘制、取消选中工具，最后关闭截图。
 - **字号/颜色**：输入过程中也可以从工具栏实时修改；颜色圆点旁的彩虹按钮可展开默认色盘，选择更多彩色、灰阶和常用预设色。
 - **历史**：`Ctrl+Z` 撤销，`Ctrl+Shift+Z` 或 `Ctrl+Y` 重做。
 - **导出**：`Ctrl+S` 保存，`Ctrl+C` 复制，工具栏上的图钉用于贴图。
 
 ### 贴图阶段
 
-通过工具栏的贴图按钮，Babry 会把当前选区导出后以 Wayland layer-shell Top layer 显示：
+通过工具栏的贴图按钮，Babry 会把当前选区导出后在独立进程中以 Wayland layer-shell Top layer 显示，编辑器随即退出并释放整张截图。贴图图像逐行解码进共享内存，缩放只改变 `wp_viewport` 目标尺寸，不在 CPU 上重采样：
 
 - 左键拖动：移动贴图
-- 滚轮：缩放贴图
+- 拖动四边或四角：调整贴图尺寸（最小 64px）
+- 滚轮：以中心为锚点缩放贴图
 - 右键：关闭贴图
 - `Esc`：关闭获得焦点的贴图
 
@@ -256,37 +253,20 @@ babry --output DP-1 --screen
 babry --output DP-1 --pin image.png
 ```
 
-`--output NAME` 可以与截图或贴图命令组合。niri 使用 `niri msg -j outputs`，Hyprland 使用 `hyprctl -j monitors`；Hyprland 的物理尺寸会按缩放比例和旋转转换为逻辑尺寸。KDE 上输出信息通过 Wayland `xdg_output` 读取，分数缩放由当前 mode 的物理尺寸除以逻辑尺寸推导（KWin 的 `wl_output.scale` 是向上取整的整数），焦点显示器通过 `org.kde.KWin.activeOutputName()` 查询。默认启动会先确定焦点显示器，再只截取该屏幕：niri/Hyprland 调用 `grim -o NAME`，KDE 调用 KWin 的 `org.kde.KWin.ScreenShot2` D-Bus 接口（返回原始像素，不经过 XDG Portal；Plasma 6.8 起无需额外桌面文件声明）。无法获取焦点时使用第一个启用的显示器；niri/Hyprland 的 IPC 查询失败会报告错误，KDE 的焦点查询失败会记录警告并回退到第一个输出。指定不存在的显示器会报错。
+`--output NAME` 可以与截图或贴图命令组合。显示器名称、逻辑位置和尺寸通过 Wayland `wl_output`/`xdg_output` 读取，分数缩放由当前 mode 的物理尺寸除以逻辑尺寸推导；焦点显示器通过 niri/Hyprland 的 IPC socket 或 KWin 的 `org.kde.KWin.activeOutputName()` 查询。默认只截取焦点显示器：niri/Hyprland 使用 `zwlr_screencopy` 把像素直接写入共享内存，KDE 调用 KWin 的 `org.kde.KWin.ScreenShot2` D-Bus 接口（返回原始像素，不经过 XDG Portal；Plasma 6.8 起无需额外桌面文件声明）。编辑覆盖层绑定到被截取的显示器。无法获取焦点时使用第一个启用的显示器；指定不存在的显示器会报错。
 
 当前截图按指定显示器单独捕获，贴图初始尺寸也按目标显示器的逻辑尺寸和缩放计算。跨显示器拖动、把同一张贴图动态迁移到另一块输出，以及不同输出间的实时 layer-shell 重绑定仍在完善中。
 
 ### KDE Plasma 6.8+
 
-- 截图走 KWin 自带的 `org.kde.KWin.ScreenShot2`（Spectacle 同款），无需安装 `grim`。
-- 编辑器窗口在 KDE 上全屏覆盖桌面（含面板）；niri/Hyprland 的全屏行为保持不变，继续使用各自窗口规则。
+- 截图走 KWin 自带的 `org.kde.KWin.ScreenShot2`（Spectacle 同款），像素经 pipe 直接读入共享内存。
+- 编辑器是 layer-shell Overlay 层，覆盖桌面和面板，不出现在任务栏或 Alt+Tab 中。
 - Plasma 6.8 之前的 ScreenShot2 需要桌面文件声明 `X-KDE-DBUS-Restricted-Interfaces`，Babry 暂不支持这些版本。
-- 窗口创建瞬间任务栏可能闪现一帧条目，Alt+Tab 中也可能可见；这是 KWin 在窗口 map 与全屏生效之间的行为，不影响截图。
 - KWin 在锁屏/熄屏期间返回黑帧，属安全行为，与 XDG Portal 一致。
 
 ## niri 配置
 
-Babry 不依赖 niri 来完成选区，但可以用 niri 的窗口规则让编辑器以全屏方式显示。将以下内容放入你的规则文件：
-
-```kdl
-window-rule {
-    match app-id=r#"^babry$"#
-    open-fullscreen true
-    open-focused true
-}
-```
-
-修改后重新加载：
-
-```bash
-niri msg action load-config-file
-```
-
-推荐快捷键：
+编辑器和贴图都是 layer-shell 表面，不需要窗口规则。推荐快捷键：
 
 ```kdl
 binds {
@@ -311,25 +291,23 @@ TrueType Collection（`.ttc`）可以通过 `BABRY_FONT_INDEX` 选择字体索�
 
 ```text
 Wayland 桌面
-    │
+    │  zwlr_screencopy（niri/Hyprland）或 KWin ScreenShot2（KDE Plasma 6.8+）
     ▼
-  grim（niri/Hyprland）或 KWin ScreenShot2（KDE Plasma 6.8+）
-    │
-    ▼
-  内存原图（PPM 管道 / 原始像素）
-    │
-    ▼
-  原生流式 CV 检测器
-    │
-    ▼
-  SCTK Layer-Shell 选区交互层
-    │
-    ▼
-  wl_shm CPU 标注编辑器
-    │      │      │
-    ▼      ▼      ▼
- PNG 保存  剪贴板  layer-shell 贴图
+memfd 共享内存截图 ──────────────┐  唯一的整屏像素副本
+    │                            │
+    ├─ 后台线程：智能选区分析     │
+    ▼                            ▼
+layer-shell 主表面直接显示截图  导出时按 64 行条带合成标注
+    │                            │
+    ├─ 子表面：遮罩、边框、手柄（1×1 纯色缓冲区 + 视口拉伸）
+    ├─ 子表面：工具栏、菜单、尺寸标签（小块双缓冲）
+    └─ 子表面：约 256 物理像素见方的标注瓦片（按需分配，空闲页归还）
+                                 │
+                                 ▼
+                     PNG 保存 / 剪贴板 / 贴图进程
 ```
+
+指针移动只改变子表面的位置和视口尺寸，不重绘整帧，合成器也不重新上传整张截图。界面以输出的物理分辨率绘制，分数缩放下文字和图标保持清晰。标注历史只保存矢量命令；显示瓦片和导出使用同一套 tiny-skia 绘制，马赛克、模糊和橡皮擦按历史顺序作用于“原图 + 之前的标注”。
 
 ### 项目结构
 
@@ -339,18 +317,22 @@ src/
 ├── compositor.rs       # 合成器检测、输出元数据与窗口锚点
 ├── config.rs           # 保存目录配置、路径展开与导出文件名
 ├── daemon.rs           # 会话 Unix socket、实例锁和后台子进程
+├── editor.rs           # 编辑器状态机：选区、工具、文字输入法、快捷键、导出
+├── export.rs           # 条带合成与流式 PNG 编码
 ├── font.rs             # 按需 mmap 字体与 ttf-parser 轮廓
 ├── kde.rs              # 按需加载 sd-bus 的 KWin ScreenShot2
-├── marks.rs            # CPU 像素标注命令与基础光栅化
-├── native.rs           # memfd/wl_shm 共享内存基础设施
-├── native_pin.rs       # SCTK layer-shell Pin
-├── pixels.rs           # RGBA 像素、PPM/PNG 编码与裁剪
-├── screencopy.rs       # zwlr_screencopy SHM 捕获
-├── core/
-│   ├── geometry.rs     # 像素几何与归一化坐标
-│   └── history.rs      # 撤销/重做历史
+├── marks.rs            # 标注命令与 tiny-skia 光栅化
+├── native_icons.rs     # 工具栏 SVG 图标几何
+├── native_pin.rs       # layer-shell 贴图
+├── native_ui.rs        # 工具栏、菜单、色盘的布局、命中测试与绘制
+├── pixels.rs           # 普通内存 RGBA 像素
+├── scene.rs            # 子表面场景、纯色平面与标注瓦片
+├── screencopy.rs       # zwlr_screencopy 捕获到 memfd
+├── shm_image.rs        # memfd 共享内存图像
+├── smart_select.rs     # 智能选区检测与层级切换
+├── core/               # 像素几何与撤销/重做历史
 ├── lib.rs              # 库模块导出
-└── main.rs             # 原生 Layer-Shell 编辑器与工作流
+└── main.rs             # 命令分发、截图会话与后台
 ```
 
 ## 开发者
@@ -365,41 +347,17 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-当前测试覆盖 CLI、几何、历史、编辑渲染、字体文字导出、局部画布、撤销重做、贴图尺寸与拖动位移，以及弱边界、等亮度色块、圆角、密集文字和 4K 小控件的 CV 回归；合成器后端覆盖 niri/Hyprland JSON 解析、KDE raw 像素解包、分数缩放推导和会话检测。界面事件测试验证滚轮层级切换、单击确认、手动拖框和局部图像生命周期。
+测试覆盖 CLI、保存目录配置、后台协议、memfd 图像的通道规范化与翻转、标注图层（橡皮擦顺序、图形内部透明、瓦片与整图渲染的效果一致性）、跨条带的流式 PNG 导出、智能选区的层级切换与窗口种子吸附，以及贴图边缘判定。
 
-### 启动性能定位
+### 启动与内存
 
-niri/Hyprland 使用 `zwlr_screencopy_manager_v1` 直接写入 wl_shm；KDE 使用按需加载的 ScreenShot2 sd-bus 兼容层。编辑器直接绘制到 SCTK wl_shm 帧，最终保存使用 PNG 编码器。当前原生迁移仍在进行，尚未宣称捕获源与显示帧完全零拷贝。
-
-设置 `BABRY_TRACE_STARTUP=1` 后，stderr 会输出 JSON 阶段耗时：
+设置 `BABRY_TRACE=1` 后，stderr 会输出截图、智能选区和首帧呈现（收到第一次 frame callback）的耗时：
 
 ```bash
-BABRY_TRACE_STARTUP=1 babry --standalone --screen
-BABRY_TRACE_STARTUP=1 babry --daemon
-# 在另一终端运行 babry 或 babry --screen
+BABRY_TRACE=1 babry --standalone
 ```
 
-原有 Slint 渲染埋点已随原生迁移移除；后续将使用 Wayland frame callback 和实际提交时间重新定义。不要把旧版本测量当作原生重构后的结果。
-
-### 编辑性能与基准
-
-原生编辑器使用 wl_shm 显示帧、显式 buffer release 生命周期和矢量标注命令；当前阶段仍在补齐智能选区、文字输入、撤销重做和多帧脏矩形重绘。不要把本阶段的基础实现当作最终性能结果。
-
-运行可重复的编辑热点基准：
-
-```bash
-cargo test --release --locked --all-targets
-```
-
-基准使用 4K 原图、960×540 选区，测量 120 次短自由笔预览和 20 次提交，输出耗时与 CPU 像素缓冲区大小。它不包含完整 UI 帧率、GPU 纹理或整个进程 RSS；大范围笔迹与全屏选区仍需要更多计算和内存。
-
-当前原生重构的基础检查：
-
-```bash
-cargo test --locked --all-targets
-```
-
-集成测试同时检查缩放复用缓冲区，以及重复指针事件、松手同帧的末次移动、四边四角缩放和边界反向拖动。niri 的隐式抓取坐标与 KWin 的表面局部坐标分别处理，避免表面移动回发事件造成贴图持续漂移；位置和尺寸未变化时不会重复提交。
+在 niri、2560×1440、1.25 倍缩放的 Release 构建上实测：截图约 66ms，编辑器首帧在其后约 65ms 呈现，智能选区在后台约 67ms 完成。进程常驻内存（`/proc/PID/status` 的 VmRSS）在选区阶段约 20MB，其中 14.4MB 是截图共享内存；画了画笔、圆形、马赛克、序号、文字、模糊和橡皮擦后约 28MB，峰值约 28MB。4K 截图本身需要 33MB。这些是单机测量，不同合成器、字体和标注范围会有差异。
 
 ### 检查 CV 选区
 
@@ -411,17 +369,17 @@ babry --debug-selection screenshot.png /tmp/babry-cv-debug
 
 输出目录包含：
 
-- `candidates.png`：所有保留候选及其编号；绿色表示质量评分至少 0.85，橙色表示较弱的候选。
-- `candidates.json`：对应编号的矩形、检测来源、四侧边界支持度、内部边缘密度、质量评分、排序值和分析耗时。
+- `candidates.png`：所有保留候选；绿色表示质量评分至少 0.72，红色表示较弱的候选。
+- `candidates.json`：矩形、质量评分、是否为窗口种子以及分析耗时。
 
-评分用于启发式排序，不是识别正确率；排序值越小越优先。原图、鼠标位置和期望选区可以一起用于复现误判。
+评分用于启发式排序，不是识别正确率。原图、鼠标位置和期望选区可以一起用于复现误判。
 
 ## 当前边界
 
-- 编辑器在 niri 下依赖 `open-fullscreen` 窗口规则；未配置时会按普通窗口显示。KDE Plasma 6.8+ 会自动全屏覆盖桌面。
 - CV 识别不到明确边界时会回退到全屏，仍可拖动鼠标精确框选。
+- 编辑器和贴图需要合成器支持 `wp_viewporter`；niri、Hyprland 和 KWin 均支持。
+- 输入法预编辑依赖合成器转发 `text-input-v3`；不支持时仍可直接键入。
 - 跨显示器拖动 Pin、OCR、贴图持久化和滚动长截图尚未实现。
-- Pin 支持 `wp_viewporter` 时，拖动缩放直接由合成器完成；不支持时使用 CPU 重采样回退。
 
 ## 参与贡献
 

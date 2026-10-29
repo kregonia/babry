@@ -10,6 +10,7 @@ memmap2 = "0.9"
 png = "0.18"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = "0.25"
+svgtypes = "0.16"
 serde_json = "1"
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["xkbcommon"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "std", "serde"] }

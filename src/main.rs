@@ -3,42 +3,7 @@
 //! The GUI path is an SCTK layer-shell surface backed by wl_shm. The daemon is
 //! only a Unix-socket launcher: it does not initialize Wayland while idle.
 
-use babry::{
-    cli, compositor, config, kde,
-    marks::{self, Mark},
-    native_pin,
-    pixels::{self, PixelSize, PixelTarget, RgbaPixels, RgbaViewMut},
-    screencopy,
-};
-use smithay_client_toolkit::reexports::client::{
-    Connection, QueueHandle, delegate_noop,
-    globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-};
-use smithay_client_toolkit::reexports::protocols::wp::viewporter::client::{
-    wp_viewport, wp_viewporter,
-};
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
-    output::{OutputHandler, OutputState},
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    seat::{
-        Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
-    },
-    shell::{
-        WaylandSurface,
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
-    },
-    shm::{Shm, ShmHandler, slot::SlotPool},
-};
+use babry::{cli, compositor, config, kde, native_pin, screencopy, smart_select};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -47,7 +12,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Instant,
 };
+
+mod editor;
+mod scene;
 
 #[path = "daemon.rs"]
 mod daemon;
@@ -91,9 +60,7 @@ fn dispatch(command: cli::Command) -> Result<(), String> {
         cli::Command::WithSaveDir { command, directory } => {
             dispatch_wrapped(*command, Some(directory))
         }
-        cli::Command::DebugSelection { .. } => {
-            Err("--debug-selection 将在原生 CV 阶段重新实现".into())
-        }
+        cli::Command::DebugSelection { source, directory } => debug_selection(&source, &directory),
     }
 }
 
@@ -146,25 +113,138 @@ fn capture_session(
     output: Option<String>,
     save_dir: Option<PathBuf>,
 ) -> Result<(), String> {
+    let started = Instant::now();
+    let trace = std::env::var_os("BABRY_TRACE").is_some();
     let outputs = compositor::outputs()?;
     let selected = compositor::select_output(&outputs, output.as_deref())?;
-    let (source, logical_width, logical_height) = match screencopy::capture(Some(&selected.name)) {
-        Ok(frame) => (frame.pixels, selected.width, selected.height),
-        Err(error) if compositor::Backend::detect()? == compositor::Backend::Kde => (
-            kde::capture(&selected.name).map_err(|_| error)?,
-            selected.width,
-            selected.height,
-        ),
+    let source = match screencopy::capture(Some(&selected.name)) {
+        Ok(image) => image,
+        // KDE 只提供 ScreenShot2；像素经 pipe 直接读入 memfd。
+        Err(error) if compositor::Backend::detect()? == compositor::Backend::Kde => {
+            kde::capture(&selected.name).map_err(|_| error)?
+        }
         Err(error) => return Err(error),
     };
+    if trace {
+        eprintln!(
+            "babry: 截图完成 {}x{} {:.1}ms",
+            source.width(),
+            source.height(),
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let directory = config::resolve_save_dir(save_dir.as_deref())?;
-    NativeEditor::run(
+    let full = babry::core::RectPx::new(0, 0, source.width(), source.height());
+    let source = Arc::new(source);
+    let (candidates, selection) = if direct_edit {
+        (None, full)
+    } else {
+        let seeds = compositor::window_regions(&selected, (source.width(), source.height()));
+        // 智能选区分析与 Wayland 初始化并行；首帧先显示合成器给出的焦点窗口。
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let image = source.clone();
+        let detect_seeds = seeds.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let candidates = smart_select::detect(&image, &detect_seeds);
+            if trace {
+                eprintln!(
+                    "babry: 智能选区 {} 个候选 {:.1}ms",
+                    candidates.len(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let _ = sender.send(candidates);
+        });
+        let selection = seeds
+            .iter()
+            .copied()
+            .max_by_key(|rect| u64::from(rect.width) * u64::from(rect.height))
+            .unwrap_or(full);
+        (Some(receiver), selection)
+    };
+    editor::NativeEditor::run(editor::Session {
         source,
         direct_edit,
-        directory,
-        logical_width,
-        logical_height,
+        save_dir: directory,
+        output: Some(selected.name.clone()),
+        logical: (selected.width, selected.height),
+        selection,
+        candidates,
+    })
+}
+
+/// 离线诊断：输出候选框 JSON 和叠加图，便于在真实截图上评估智能选区。
+fn debug_selection(source: &Path, directory: &Path) -> Result<(), String> {
+    let image = babry::shm_image::ShmImage::read_png(source)?;
+    let started = Instant::now();
+    let candidates = smart_select::detect(&image, &[]);
+    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let list: Vec<_> = candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "x": c.rect.x, "y": c.rect.y, "width": c.rect.width, "height": c.rect.height,
+                "quality": c.quality, "seed": c.seed,
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "width": image.width(), "height": image.height(),
+        "elapsed_ms": elapsed, "candidates": list,
+    });
+    std::fs::write(
+        directory.join("candidates.json"),
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?,
     )
+    .map_err(|e| e.to_string())?;
+    let mut pixmap = tiny_skia::Pixmap::new(image.width(), image.height()).ok_or("图像尺寸无效")?;
+    let row = image.width() as usize * 4;
+    for (y, line) in pixmap.data_mut().chunks_exact_mut(row).enumerate() {
+        image.read_row(0, y as i32, line);
+    }
+    for c in &candidates {
+        let mut paint = tiny_skia::Paint::default();
+        let good = c.quality >= 0.72;
+        paint.set_color_rgba8(
+            if good { 40 } else { 255 },
+            if good { 220 } else { 80 },
+            60,
+            200,
+        );
+        if let Some(rect) = tiny_skia::Rect::from_xywh(
+            c.rect.x as f32 + 0.5,
+            c.rect.y as f32 + 0.5,
+            c.rect.width as f32 - 1.0,
+            c.rect.height as f32 - 1.0,
+        ) {
+            let path = tiny_skia::PathBuilder::from_rect(rect);
+            let stroke = tiny_skia::Stroke {
+                width: 1.0,
+                ..Default::default()
+            };
+            pixmap.stroke_path(
+                &path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
+    }
+    let file =
+        std::fs::File::create(directory.join("candidates.png")).map_err(|e| e.to_string())?;
+    let mut encoder =
+        png::Encoder::new(std::io::BufWriter::new(file), image.width(), image.height());
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(pixmap.data()))
+        .map_err(|e| e.to_string())?;
+    println!("{} 个候选，{elapsed:.1}ms", candidates.len());
+    Ok(())
 }
 
 fn list_outputs() -> Result<(), String> {
@@ -268,540 +348,4 @@ fn run_daemon() -> Result<(), String> {
             }
         }
     })
-}
-
-struct NativeEditor {
-    registry_state: RegistryState,
-    seat_state: SeatState,
-    output_state: OutputState,
-    shm: Shm,
-    layer: LayerSurface,
-    pool: SlotPool,
-    _viewport: Option<wp_viewport::WpViewport>,
-    _viewporter: Option<wp_viewporter::WpViewporter>,
-    source: RgbaPixels,
-    buffers: Vec<smithay_client_toolkit::shm::slot::Buffer>,
-    width: u32,
-    height: u32,
-    logical_width: u32,
-    logical_height: u32,
-    selection: babry::core::RectPx,
-    marks: Vec<Mark>,
-    pending_mark: Option<Mark>,
-    undo_stack: Vec<Vec<Mark>>,
-    redo_stack: Vec<Vec<Mark>>,
-    active_tool: u8,
-    pointer: Option<wl_pointer::WlPointer>,
-    keyboard: Option<wl_keyboard::WlKeyboard>,
-    pressed: bool,
-    drag_start: Option<(f64, f64)>,
-    modifiers: Modifiers,
-    control_down: bool,
-    direct_edit: bool,
-    save_dir: PathBuf,
-    first_configure: bool,
-    dirty: bool,
-    exit: bool,
-}
-
-impl NativeEditor {
-    fn run(
-        source: RgbaPixels,
-        direct_edit: bool,
-        save_dir: PathBuf,
-        logical_width: u32,
-        logical_height: u32,
-    ) -> Result<(), String> {
-        let connection =
-            Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
-        let (globals, mut queue) = registry_queue_init::<NativeEditor>(&connection)
-            .map_err(|error| format!("读取 Wayland 全局对象失败: {error}"))?;
-        let qh = queue.handle();
-        let compositor = CompositorState::bind(&globals, &qh)
-            .map_err(|error| format!("wl_compositor 不可用: {error}"))?;
-        let shell = LayerShell::bind(&globals, &qh)
-            .map_err(|error| format!("wlr-layer-shell 不可用: {error}"))?;
-        let shm = Shm::bind(&globals, &qh).map_err(|error| format!("wl_shm 不可用: {error}"))?;
-        let width = source.width();
-        let height = source.height();
-        let surface = compositor.create_surface(&qh);
-        let viewporter: Option<wp_viewporter::WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
-        let viewport = viewporter
-            .as_ref()
-            .map(|manager| manager.get_viewport(&surface, &qh, ()));
-        if let Some(viewport) = &viewport {
-            viewport.set_source(0.0, 0.0, width as f64, height as f64);
-            viewport.set_destination(logical_width as i32, logical_height as i32);
-        }
-        let layer = shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("babry"), None);
-        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer.set_size(logical_width, logical_height);
-        layer.commit();
-        let pool = SlotPool::new(width as usize * height as usize * 4, &shm)
-            .map_err(|error| format!("无法创建编辑共享内存: {error}"))?;
-        let mut editor = Self {
-            registry_state: RegistryState::new(&globals),
-            seat_state: SeatState::new(&globals, &qh),
-            output_state: OutputState::new(&globals, &qh),
-            shm,
-            layer,
-            pool,
-            _viewport: viewport,
-            _viewporter: viewporter,
-            source,
-            buffers: Vec::new(),
-            width,
-            height,
-            logical_width,
-            logical_height,
-            selection: babry::core::RectPx::new(0, 0, width, height),
-            marks: Vec::new(),
-            pending_mark: None,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            active_tool: 0,
-            pointer: None,
-            keyboard: None,
-            pressed: false,
-            drag_start: None,
-            modifiers: Modifiers::default(),
-            control_down: false,
-            direct_edit,
-            save_dir,
-            first_configure: true,
-            dirty: true,
-            exit: false,
-        };
-        while !editor.exit {
-            queue
-                .blocking_dispatch(&mut editor)
-                .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
-        }
-        Ok(())
-    }
-
-    fn draw(&mut self, qh: &QueueHandle<Self>) -> Result<(), String> {
-        if !self.dirty && !self.buffers.is_empty() {
-            return Ok(());
-        }
-        let index = self
-            .buffers
-            .iter()
-            .position(|buffer| buffer.canvas(&mut self.pool).is_some())
-            .unwrap_or_else(|| {
-                let (buffer, _) = self
-                    .pool
-                    .create_buffer(
-                        self.width as i32,
-                        self.height as i32,
-                        self.width as i32 * 4,
-                        wl_shm::Format::Argb8888,
-                    )
-                    .expect("editor buffer allocation");
-                self.buffers.push(buffer);
-                self.buffers.len() - 1
-            });
-        let buffer = &self.buffers[index];
-        let canvas = buffer.canvas(&mut self.pool).ok_or("编辑帧仍在使用")?;
-        for (index, dst) in canvas.chunks_exact_mut(4).enumerate() {
-            let x = index as u32 % self.width;
-            let y = index as u32 / self.width;
-            let source = self.source.pixel(x, y).unwrap_or([0, 0, 0, 255]);
-            let dark = !self.direct_edit
-                && !self.selection.contains(babry::core::PointPx {
-                    x: x as f32,
-                    y: y as f32,
-                });
-            let factor = if dark { 2 } else { 1 };
-            let alpha = u16::from(source[3]);
-            dst.copy_from_slice(&[
-                ((u16::from(source[2]) * alpha / 255 / factor as u16) as u8),
-                ((u16::from(source[1]) * alpha / 255 / factor as u16) as u8),
-                ((u16::from(source[0]) * alpha / 255 / factor as u16) as u8),
-                source[3],
-            ]);
-        }
-        let mut view = RgbaViewMut::new(PixelSize::new(self.width, self.height)?, canvas)?;
-        marks::render_marks(&mut view, &self.marks, (0, 0));
-        if let Some(mark) = &self.pending_mark {
-            marks::render_marks(&mut view, std::slice::from_ref(mark), (0, 0));
-        }
-        draw_toolbar(&mut view, self.width, self.height, self.active_tool);
-        buffer
-            .attach_to(self.layer.wl_surface())
-            .map_err(|error| format!("附加编辑帧失败: {error}"))?;
-        self.dirty = false;
-        self.layer
-            .wl_surface()
-            .frame(qh, self.layer.wl_surface().clone());
-        self.layer
-            .wl_surface()
-            .damage_buffer(0, 0, self.width as i32, self.height as i32);
-        self.layer.commit();
-        Ok(())
-    }
-
-    fn export_pixels(&self) -> Result<RgbaPixels, String> {
-        let rect = if self.direct_edit {
-            babry::core::RectPx::new(0, 0, self.source.width(), self.source.height())
-        } else {
-            self.selection
-        };
-        let mut image = self.source.crop(rect)?;
-        marks::render_marks(&mut image, &self.marks, (rect.x, rect.y));
-        Ok(image)
-    }
-
-    fn save(&mut self) -> Result<(), String> {
-        let output = config::output_path(&self.save_dir)?;
-        pixels::write_png(&output, &self.export_pixels()?)?;
-        eprintln!("已保存: {}", output.display());
-        self.exit = true;
-        Ok(())
-    }
-
-    fn copy(&mut self) -> Result<(), String> {
-        let output = config::output_path(&self.save_dir)?;
-        pixels::write_png(&output, &self.export_pixels()?)?;
-        let file = std::fs::File::open(&output).map_err(|error| error.to_string())?;
-        let status = Command::new("wl-copy")
-            .args(["--type", "image/png"])
-            .stdin(file)
-            .status()
-            .map_err(|error| error.to_string())?;
-        if !status.success() {
-            return Err(format!("wl-copy 失败: {status}"));
-        }
-        self.exit = true;
-        Ok(())
-    }
-
-    fn undo(&mut self) {
-        if let Some(previous) = self.undo_stack.pop() {
-            self.redo_stack.push(self.marks.clone());
-            self.marks = previous;
-            self.dirty = true;
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(self.marks.clone());
-            self.marks = next;
-            self.dirty = true;
-        }
-    }
-}
-
-impl CompositorHandler for NativeEditor {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
-    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        let _ = self.draw(qh);
-    }
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-}
-impl OutputHandler for NativeEditor {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.output_state
-    }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-}
-impl SeatHandler for NativeEditor {
-    fn seat_state(&mut self) -> &mut SeatState {
-        &mut self.seat_state
-    }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-    fn new_capability(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-        capability: Capability,
-    ) {
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
-        }
-        if capability == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
-        }
-    }
-    fn remove_capability(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: wl_seat::WlSeat,
-        capability: Capability,
-    ) {
-        if capability == Capability::Pointer {
-            self.pointer = None;
-        }
-        if capability == Capability::Keyboard {
-            self.keyboard = None;
-        }
-    }
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
-}
-impl KeyboardHandler for NativeEditor {
-    fn enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-        _: &[u32],
-        _: &[Keysym],
-    ) {
-    }
-    fn leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
-    }
-    fn press_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        if event.keysym == Keysym::Control_L || event.keysym == Keysym::Control_R {
-            self.control_down = true;
-        }
-        if event.keysym == Keysym::Escape {
-            self.exit = true;
-        }
-        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::s {
-            let _ = self.save();
-        }
-        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::c {
-            let _ = self.copy();
-        }
-        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::z {
-            self.undo();
-        }
-        if (self.modifiers.ctrl || self.control_down) && event.keysym == Keysym::y {
-            self.redo();
-        }
-    }
-    fn repeat_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        _: KeyEvent,
-    ) {
-    }
-    fn release_key(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        event: KeyEvent,
-    ) {
-        if event.keysym == Keysym::Control_L || event.keysym == Keysym::Control_R {
-            self.control_down = false;
-        }
-    }
-    fn update_modifiers(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_keyboard::WlKeyboard,
-        _: u32,
-        modifiers: Modifiers,
-        _: RawModifiers,
-        _: u32,
-    ) {
-        self.modifiers = modifiers;
-    }
-}
-impl PointerHandler for NativeEditor {
-    fn pointer_frame(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        _: &wl_pointer::WlPointer,
-        events: &[PointerEvent],
-    ) {
-        for event in events {
-            if event.surface != *self.layer.wl_surface() {
-                continue;
-            }
-            let physical = (
-                event.position.0 * self.width as f64 / self.logical_width.max(1) as f64,
-                event.position.1 * self.height as f64 / self.logical_height.max(1) as f64,
-            );
-            match event.kind {
-                PointerEventKind::Press { button: 0x110, .. } => {
-                    if let Some(action) =
-                        toolbar_hit(event.position, self.logical_width, self.logical_height)
-                    {
-                        match action {
-                            3 => self.undo(),
-                            4 => self.redo(),
-                            tool => {
-                                self.active_tool = tool;
-                                self.dirty = true;
-                            }
-                        }
-                        continue;
-                    }
-                    self.pressed = true;
-                    self.drag_start = Some(physical);
-                    if self.direct_edit && self.active_tool != 0 {
-                        self.pending_mark = Some(Mark::new(
-                            self.active_tool,
-                            physical.0 as f32,
-                            physical.1 as f32,
-                            [255, 59, 48, 255],
-                            6,
-                        ));
-                    }
-                }
-                PointerEventKind::Release { button: 0x110, .. } => {
-                    self.pressed = false;
-                    self.drag_start = None;
-                    if let Some(mark) = self.pending_mark.take() {
-                        self.undo_stack.push(self.marks.clone());
-                        self.redo_stack.clear();
-                        self.marks.push(mark);
-                        self.dirty = true;
-                    }
-                }
-                PointerEventKind::Motion { .. } if self.pressed => {
-                    if let Some(start) = self.drag_start {
-                        if let Some(mark) = &mut self.pending_mark {
-                            mark.update(physical.0 as f32, physical.1 as f32);
-                        } else {
-                            let x = start.0.min(physical.0).max(0.0) as u32;
-                            let y = start.1.min(physical.1).max(0.0) as u32;
-                            let right = start.0.max(physical.0).min(self.width as f64) as u32;
-                            let bottom = start.1.max(physical.1).min(self.height as f64) as u32;
-                            self.selection = babry::core::RectPx::new(
-                                x as i32,
-                                y as i32,
-                                right.saturating_sub(x),
-                                bottom.saturating_sub(y),
-                            );
-                        }
-                        self.dirty = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let _ = self.draw(qh);
-    }
-}
-fn toolbar_hit(position: (f64, f64), width: u32, height: u32) -> Option<u8> {
-    if position.1 < height as f64 - 60.0 || position.0 < width as f64 - 590.0 {
-        return None;
-    }
-    let index = ((position.0 - (width as f64 - 584.0)) / 36.0).floor() as usize;
-    [1, 2, 11, 7, 3, 4].get(index).copied()
-}
-fn draw_toolbar<T: PixelTarget>(view: &mut T, width: u32, height: u32, active: u8) {
-    let left = width.saturating_sub(600);
-    let top = height.saturating_sub(72);
-    for y in top..height {
-        for x in left..width {
-            if let Some(p) = view.pixel_mut(x, y) {
-                p.copy_from_slice(&[24, 31, 43, 235]);
-            }
-        }
-    }
-    for (i, tool) in [1u8, 2, 11, 7, 3, 4].iter().enumerate() {
-        let x = left + 16 + i as u32 * 36;
-        if *tool == active {
-            for y in top + 8..top + 48 {
-                for xx in x..x + 30 {
-                    if let Some(p) = view.pixel_mut(xx, y) {
-                        p.copy_from_slice(&[90, 75, 170, 255]);
-                    }
-                }
-            }
-        }
-    }
-}
-impl LayerShellHandler for NativeEditor {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
-    }
-    fn configure(
-        &mut self,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-        _: &LayerSurface,
-        _: LayerSurfaceConfigure,
-        _: u32,
-    ) {
-        if self.first_configure {
-            self.first_configure = false;
-            let _ = self.draw(qh);
-        }
-    }
-}
-impl ShmHandler for NativeEditor {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-delegate_compositor!(NativeEditor);
-delegate_noop!(NativeEditor: ignore wp_viewporter::WpViewporter);
-delegate_noop!(NativeEditor: ignore wp_viewport::WpViewport);
-delegate_output!(NativeEditor);
-delegate_shm!(NativeEditor);
-delegate_seat!(NativeEditor);
-delegate_keyboard!(NativeEditor);
-delegate_pointer!(NativeEditor);
-delegate_layer!(NativeEditor);
-delegate_registry!(NativeEditor);
-impl ProvidesRegistryState for NativeEditor {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry_state
-    }
-    registry_handlers![OutputState, SeatState];
 }

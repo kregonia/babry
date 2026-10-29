@@ -120,19 +120,32 @@ pub fn output_path(directory: &Path) -> Result<PathBuf, String> {
 }
 
 fn timestamp_name() -> String {
-    let millis = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let seconds = millis / 1000;
-    let day = seconds / 86_400;
-    let (year, month, date) = civil_date(day as i64);
-    let hour = (seconds / 3_600) % 24;
-    let minute = (seconds / 60) % 60;
-    let second = seconds % 60;
+        .unwrap_or_default();
+    let millis = now.subsec_millis();
+    let seconds = now.as_secs() as libc::time_t;
+    // SAFETY: localtime_r 只写入调用方提供的 tm，线程安全。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if !unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        return format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}-{millis:03}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        );
+    }
+    // 时区数据不可用时退回 UTC。
+    let seconds = now.as_secs();
+    let (year, month, date) = civil_date((seconds / 86_400) as i64);
     format!(
-        "{year:04}{month:02}{date:02}-{hour:02}{minute:02}{second:02}-{:03}",
-        millis % 1000
+        "{year:04}{month:02}{date:02}-{:02}{:02}{:02}-{millis:03}",
+        (seconds / 3_600) % 24,
+        (seconds / 60) % 60,
+        seconds % 60
     )
 }
 

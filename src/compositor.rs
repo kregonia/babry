@@ -248,19 +248,52 @@ pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> 
             }
         }
         Ok(Backend::Niri) => {
+            // 只取截图输出上当前活动工作区的窗口，避免其他显示器的坐标混入。
+            let workspace = niri_query("Workspaces").ok().and_then(|v| {
+                v["Workspaces"].as_array().and_then(|list| {
+                    list.iter()
+                        .find(|w| w["output"] == output.name.as_str() && w["is_active"] == true)
+                        .and_then(|w| w["id"].as_u64())
+                })
+            });
             if let Ok(v) = niri_query("Windows")
                 && let Some(list) = v["Windows"].as_array()
             {
-                for w in list {
-                    let l = &w["layout"];
-                    if let (Some(x), Some(y), Some(width), Some(height)) = (
-                        l["pos_in_scrolling_layout"][0].as_f64(),
-                        l["pos_in_scrolling_layout"][1].as_f64(),
-                        l["window_size"][0].as_f64(),
-                        l["window_size"][1].as_f64(),
-                    ) && w["is_focused"] == true
-                    {
-                        add(x, y, width, height)
+                for window in list {
+                    if workspace.is_some() && window["workspace_id"].as_u64() != workspace {
+                        continue;
+                    }
+                    let layout = &window["layout"];
+                    let (Some(width), Some(height)) = (
+                        layout["window_size"][0].as_f64(),
+                        layout["window_size"][1].as_f64(),
+                    ) else {
+                        continue;
+                    };
+                    // 新版 niri 给出可见窗口在工作区视图中的逻辑位置。
+                    if let (Some(x), Some(y)) = (
+                        layout["tile_pos_in_workspace_view"][0].as_f64(),
+                        layout["tile_pos_in_workspace_view"][1].as_f64(),
+                    ) {
+                        let dx = layout["window_offset_in_tile"][0].as_f64().unwrap_or(0.0);
+                        let dy = layout["window_offset_in_tile"][1].as_f64().unwrap_or(0.0);
+                        add(
+                            f64::from(output.x) + x + dx,
+                            f64::from(output.y) + y + dy,
+                            width,
+                            height,
+                        );
+                    } else if window["is_focused"] == true {
+                        // 没有位置时 pos_in_scrolling_layout 只是列/行索引；焦点列通常居中，
+                        // 用窗口尺寸估算，再由智能选区吸附到真实边缘。
+                        add(
+                            ((f64::from(output.width) - width).max(0.0)) * 0.5
+                                + f64::from(output.x),
+                            ((f64::from(output.height) - height).max(0.0)) * 0.5
+                                + f64::from(output.y),
+                            width,
+                            height,
+                        );
                     }
                 }
             }

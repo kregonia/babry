@@ -1,5 +1,5 @@
 //! 按需加载系统 sd-bus，保留 KWin ScreenShot2 截图语义，不引入异步 D-Bus 运行时。
-use crate::pixels::{PixelSize, RgbaPixels};
+use crate::shm_image::{ChannelOrder, ShmImage};
 use libc::{c_char, c_int, c_void};
 use libloading::Library;
 use std::{
@@ -173,7 +173,7 @@ pub fn active_output() -> Result<String, String> {
         Ok(CStr::from_ptr(name).to_string_lossy().into_owned())
     }
 }
-pub fn capture(name: &str) -> Result<RgbaPixels, String> {
+pub fn capture(name: &str) -> Result<ShmImage, String> {
     let mut session = Session::new(
         c"org.kde.KWin.ScreenShot2",
         c"/org/kde/KWin/ScreenShot2",
@@ -250,31 +250,22 @@ pub fn capture(name: &str) -> Result<RgbaPixels, String> {
             Api::check((session.api.exit)(session.reply))?;
         }
     }
-    let size = PixelSize::new(width, height)?;
     if kind != "raw"
         || format != 16
         || width == 0
         || height == 0
-        || (stride as usize) < size.stride
+        || u64::from(stride) < u64::from(width) * 4
         || u64::from(stride) * u64::from(height) > 512 * 1024 * 1024
     {
         return Err(format!(
             "KWin 截图格式无效: {kind}, format={format}, {width}x{height}, stride={stride}"
         ));
     }
-    let mut image = RgbaPixels::new(size);
-    let padding = stride as usize - size.stride;
-    let mut discard = vec![0u8; padding];
-    for row in image.bytes.chunks_exact_mut(size.stride) {
-        reader
-            .read_exact(row)
-            .map_err(|e| format!("KWin 像素不完整: {e}"))?;
-        if padding > 0 {
-            reader.read_exact(&mut discard).map_err(|e| e.to_string())?;
-        }
-        for p in row.chunks_exact_mut(4) {
-            p[3] = 255;
-        }
-    }
+    // QImage::Format_RGBX8888：沿用 KWin 的行跨度直接读进 memfd，再原地交换通道。
+    let mut image = ShmImage::new(width, height, stride)?;
+    reader
+        .read_exact(image.bytes_mut())
+        .map_err(|e| format!("KWin 像素不完整: {e}"))?;
+    image.normalize(ChannelOrder::Rgba, true, false);
     Ok(image)
 }

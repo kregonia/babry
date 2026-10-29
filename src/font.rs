@@ -42,6 +42,7 @@ impl Fonts {
             }
         }
     }
+    /// 绘制文字，返回排版宽高。
     pub fn text(
         &mut self,
         text: &str,
@@ -51,31 +52,53 @@ impl Fonts {
         wrap: f32,
         mut draw: impl FnMut(&tiny_skia::Path),
     ) -> (f32, f32) {
+        let layout = self.layout(text, x, y, size, wrap, Some(&mut draw));
+        (layout.0, layout.1)
+    }
+
+    /// 只测量文字：返回 (宽, 高, 光标 x, 光标 y)，坐标相对文字起点。
+    pub fn measure(&mut self, text: &str, size: f32, wrap: f32) -> (f32, f32, f32, f32) {
+        self.layout(text, 0.0, 0.0, size, wrap, None)
+    }
+
+    fn face_for(&mut self, ch: char) -> Option<usize> {
         if self.faces.is_empty() {
             self.load("sans-serif");
         }
+        let has = |faces: &[(Mmap, u32)]| {
+            faces.iter().position(|(m, i)| {
+                ttf_parser::Face::parse(m, *i)
+                    .ok()
+                    .is_some_and(|f| f.glyph_index(ch).is_some())
+            })
+        };
+        let mut index = has(&self.faces);
+        if index.is_none() && self.faces.len() < 4 && !ch.is_whitespace() {
+            self.load(&format!("sans-serif:charset={:x}", ch as u32));
+            index = has(&self.faces);
+        }
+        index
+    }
+
+    fn layout(
+        &mut self,
+        text: &str,
+        x: f32,
+        y: f32,
+        size: f32,
+        wrap: f32,
+        mut draw: Option<&mut dyn FnMut(&tiny_skia::Path)>,
+    ) -> (f32, f32, f32, f32) {
+        let line_height = size * 1.25;
         let (mut cx, mut cy, mut max) = (x, y, x);
         for ch in text.chars() {
             if ch == '\n' {
                 max = max.max(cx);
                 cx = x;
-                cy += size * 1.25;
+                cy += line_height;
                 continue;
             }
-            let mut face_index = self.faces.iter().position(|(m, i)| {
-                ttf_parser::Face::parse(m, *i)
-                    .ok()
-                    .is_some_and(|f| f.glyph_index(ch).is_some())
-            });
-            if face_index.is_none() && self.faces.len() < 4 {
-                self.load(&format!("sans-serif:charset={:x}", ch as u32));
-                face_index = self.faces.iter().position(|(m, i)| {
-                    ttf_parser::Face::parse(m, *i)
-                        .ok()
-                        .is_some_and(|f| f.glyph_index(ch).is_some())
-                });
-            }
-            let Some(index) = face_index else {
+            let Some(index) = self.face_for(ch) else {
                 cx += size * 0.6;
                 continue;
             };
@@ -91,22 +114,24 @@ impl Fonts {
             if cx > x && cx + advance > x + wrap {
                 max = max.max(cx);
                 cx = x;
-                cy += size * 1.25;
+                cy += line_height;
             }
-            let mut outline = Outline(PathBuilder::new());
-            if face.outline_glyph(id, &mut outline).is_some()
-                && let Some(path) = outline.0.finish()
-            {
-                let baseline = cy + f32::from(face.ascender()) * scale;
-                if let Some(path) =
-                    path.transform(Transform::from_row(scale, 0.0, 0.0, -scale, cx, baseline))
+            if let Some(draw) = draw.as_mut() {
+                let mut outline = Outline(PathBuilder::new());
+                if face.outline_glyph(id, &mut outline).is_some()
+                    && let Some(path) = outline.0.finish()
                 {
-                    draw(&path);
+                    let baseline = cy + f32::from(face.ascender()) * scale;
+                    if let Some(path) =
+                        path.transform(Transform::from_row(scale, 0.0, 0.0, -scale, cx, baseline))
+                    {
+                        draw(&path);
+                    }
                 }
             }
             cx += advance;
         }
-        (max.max(cx) - x, cy - y + size * 1.25)
+        (max.max(cx) - x, cy - y + line_height, cx - x, cy - y)
     }
 }
 struct Outline(PathBuilder);
