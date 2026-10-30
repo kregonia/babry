@@ -1,0 +1,61 @@
+name: release
+
+# 打版本标签时构建二进制并发布 GitHub Release。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # 生成发布说明时需要历史提交和之前的标签。
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libfontconfig-dev libxkbcommon-dev libwayland-dev
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Verify release binary
+        run: |
+          file target/release/babry
+          target/release/babry --help
+
+      - name: Stage release asset
+        run: |
+          mkdir -p dist
+          cp target/release/babry "dist/babry-amd64-linux-${GITHUB_REF_NAME}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 重跑时先删除同名 Release，避免资产与当前标签不一致；
+          # 标签本身由推送触发，保持不动。
+          gh release delete "${GITHUB_REF_NAME}" --yes --cleanup-tag=false || true
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "babry ${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            --notes-start-tag v0.1.4
