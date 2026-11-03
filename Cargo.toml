@@ -1,6 +1,6 @@
 [package]
 name = "babry"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 
 [dependencies]
@@ -17,6 +17,7 @@ toml = { version = "1.1", default-features = false, features = ["parse", "std", 
 
 [dev-dependencies]
 tempfile = "3"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [profile.dev]
 opt-level = 1

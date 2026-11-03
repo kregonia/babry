@@ -19,10 +19,17 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
+      - name: Require a version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          test "$RELEASE_REF_TYPE" = tag
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          # 生成发布说明时需要历史提交和之前的标签。
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -34,8 +41,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config libfontconfig-dev libxkbcommon-dev libwayland-dev
 
-      - name: Build release binary
-        run: cargo build --locked --release
+      - name: Test and build release binary
+        run: |
+          cargo test --locked --all-targets
+          cargo build --locked --release
 
       - name: Verify release binary
         run: |
@@ -46,16 +55,23 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/babry "dist/babry-amd64-linux-${GITHUB_REF_NAME}"
+          (cd dist && sha256sum "babry-amd64-linux-${GITHUB_REF_NAME}" > SHA256SUMS)
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 重跑时先删除同名 Release，避免资产与当前标签不一致；
-          # 标签本身由推送触发，保持不动。
-          gh release delete "${GITHUB_REF_NAME}" --yes --cleanup-tag=false || true
-          gh release create "${GITHUB_REF_NAME}" dist/* \
-            --title "babry ${GITHUB_REF_NAME}" \
-            --verify-tag \
-            --generate-notes \
-            --notes-start-tag v0.1.4
+          notes="docs/releases/${GITHUB_REF_NAME}.md"
+          if test -f "$notes"; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--generate-notes)
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "babry ${GITHUB_REF_NAME}" \
+              --verify-tag \
+              "${notes_args[@]}"
+          fi

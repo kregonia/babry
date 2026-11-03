@@ -15,10 +15,10 @@ use smithay_client_toolkit::{
     compositor::{CompositorState, Region},
     reexports::{
         client::{
-            QueueHandle,
+            Connection, QueueHandle,
             protocol::{
-                wl_buffer::WlBuffer, wl_shm, wl_shm_pool::WlShmPool, wl_subsurface::WlSubsurface,
-                wl_surface::WlSurface,
+                wl_buffer::WlBuffer, wl_display::WlDisplay, wl_shm, wl_shm_pool::WlShmPool,
+                wl_subsurface::WlSubsurface, wl_surface::WlSurface,
             },
         },
         protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
@@ -39,6 +39,10 @@ pub type IRect = (i32, i32, i32, i32);
 /// 标注瓦片缓冲区的 wl_buffer 用户数据：全局槽位编号。
 #[derive(Clone, Copy, Debug)]
 pub struct TileSlot(pub usize);
+
+/// 旧 wl_buffer 已销毁且合成器处理完该请求后，才能给底层 memfd 打洞。
+#[derive(Clone, Copy, Debug)]
+pub struct RetiredSlot(pub usize);
 
 pub struct Plane {
     pub surface: WlSurface,
@@ -112,8 +116,8 @@ impl Plane {
         self.surface.attach(None, 0, 0);
         self.surface.commit();
         self.shown = false;
-        self.geometry.2 = 0;
-        self.geometry.3 = 0;
+        // 重现时同时提交位置和视口，避免只恢复内容而漏掉父表面的双缓冲位置状态。
+        self.geometry = (i32::MIN, i32::MIN, 0, 0);
         true
     }
 }
@@ -191,6 +195,7 @@ struct SlotState {
     buffer: Option<WlBuffer>,
     busy: bool,
     resident: bool,
+    retiring: bool,
 }
 
 struct Tile {
@@ -201,6 +206,7 @@ struct Tile {
 /// 标注瓦片：每个瓦片固定两个槽位，整池按需分配物理页。
 struct Tiles {
     pool: RawPool,
+    display: WlDisplay,
     logical: u32,
     cols: u32,
     rows: u32,
@@ -208,13 +214,21 @@ struct Tiles {
     tiles: Vec<Option<Tile>>,
     slots: Vec<SlotState>,
     pending: std::collections::BTreeSet<usize>,
+    preview: bool,
 }
 
 impl Tiles {
-    fn new(shm: &Shm, logical: (u32, u32), scale: f32, step: u32) -> Result<Self, String> {
+    fn new(
+        shm: &Shm,
+        display: WlDisplay,
+        logical: (u32, u32),
+        scale: f32,
+        step: u32,
+    ) -> Result<Self, String> {
         // 瓦片约 256 物理像素见方，逻辑边长对齐到缩放网格，保证瓦片边缘落在整数物理像素。
         let size = (((256.0 / scale) / step as f32).ceil() as u32).max(1) * step;
-        let max_physical = (size as f32 * scale).ceil() as u32;
+        // 为分数视口的双线性采样保留四周各 1 像素，另留取整误差。
+        let max_physical = (size as f32 * scale).ceil() as u32 + 4;
         let cols = logical.0.div_ceil(size);
         let rows = logical.1.div_ceil(size);
         let slot_bytes = (max_physical as usize * max_physical as usize * 4).next_multiple_of(4096);
@@ -228,6 +242,7 @@ impl Tiles {
             .map_err(|error| format!("无法创建标注共享内存: {error}"))?;
         Ok(Self {
             pool,
+            display,
             logical: size,
             cols,
             rows,
@@ -238,26 +253,51 @@ impl Tiles {
                     buffer: None,
                     busy: false,
                     resident: false,
+                    retiring: false,
                 })
                 .collect(),
             pending: Default::default(),
+            preview: false,
         })
     }
 
-    fn release_slot(&mut self, slot: usize) {
-        let offset = slot * self.slot_bytes;
-        shm_image::release_pages(self.pool.as_fd(), offset, self.slot_bytes);
-        self.slots[slot].resident = false;
+    fn release_slot(&mut self, slot: usize, qh: &QueueHandle<NativeEditor>) {
+        let state = &mut self.slots[slot];
+        if state.busy || state.retiring || !state.resident {
+            return;
+        }
+        if let Some(buffer) = state.buffer.take() {
+            // KWin 的 udmabuf 导入会固定 memfd 的物理页。wl_buffer.release 只代表
+            // 允许 CPU 写入，不代表导入对象已销毁；打洞后继续复用同一个 wl_buffer
+            // 会让 GPU 读到旧页。先销毁 buffer，再用 sync 确认服务端处理完销毁请求。
+            buffer.destroy();
+            state.retiring = true;
+            self.display.sync(qh, RetiredSlot(slot));
+        } else {
+            // 新绘制但完全透明的槽位尚未创建 wl_buffer，无服务端导入，直接归还。
+            self.reclaim(slot);
+        }
     }
 
-    fn released(&mut self, slot: usize) {
+    fn reclaim(&mut self, slot: usize) {
+        let state = &mut self.slots[slot];
+        debug_assert!(!state.busy && state.buffer.is_none());
+        let offset = slot * self.slot_bytes;
+        shm_image::release_pages(self.pool.as_fd(), offset, self.slot_bytes);
+        state.resident = false;
+        state.retiring = false;
+    }
+
+    fn released(&mut self, slot: usize, qh: &QueueHandle<NativeEditor>) {
         let Some(state) = self.slots.get_mut(slot) else {
             return;
         };
         state.busy = false;
         let attached = self.tiles[slot / 2].as_ref().and_then(|tile| tile.attached);
-        if attached != Some(slot) && state.resident {
-            self.release_slot(slot);
+        // 连续预览期间保留双缓冲，包括暂时隐藏、随后可能重现的图形瓦片。
+        // 笔画提交后只保留当前画面，隐藏瓦片归还两个槽位。
+        if attached != Some(slot) && !self.preview {
+            self.release_slot(slot, qh);
         }
     }
 }
@@ -316,6 +356,7 @@ pub struct SceneInput<'a> {
     pub marks: &'a [Mark],
     pub source: &'a ShmImage,
     pub fonts: &'a mut Fonts,
+    pub preview: bool,
     /// 文字光标的物理坐标矩形。
     pub caret: Option<RectPx>,
 }
@@ -324,9 +365,59 @@ fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
+#[derive(Debug)]
+struct TileGeometry {
+    logical: IRect,
+    pixels: RectPx,
+    source: (f64, f64, f64, f64),
+}
+
+/// wp_viewport 的 source 使用 wl_fixed（1/256 像素）。相邻瓦片共用同一个
+/// 量化后的边界，并保留外侧采样像素，防止 1.2 等缩放下接缝或整体累计偏移。
+fn tile_geometry(
+    logical: (u32, u32),
+    physical: (u32, u32),
+    size: u32,
+    index: usize,
+) -> TileGeometry {
+    let cols = logical.0.div_ceil(size);
+    let (col, row) = (index as u32 % cols, index as u32 / cols);
+    let (x0, y0) = (col * size, row * size);
+    let (x1, y1) = (
+        ((col + 1) * size).min(logical.0),
+        ((row + 1) * size).min(logical.1),
+    );
+    let fixed = |value: u32, full: u32, logical: u32| {
+        (value as f64 * full as f64 / logical as f64 * 256.0).round() / 256.0
+    };
+    let (left, top) = (
+        fixed(x0, physical.0, logical.0),
+        fixed(y0, physical.1, logical.1),
+    );
+    let (right, bottom) = (
+        fixed(x1, physical.0, logical.0),
+        fixed(y1, physical.1, logical.1),
+    );
+    let px = (left.floor() as i32 - 1).max(0);
+    let py = (top.floor() as i32 - 1).max(0);
+    let pr = (right.ceil() as u32 + 1).min(physical.0);
+    let pb = (bottom.ceil() as u32 + 1).min(physical.1);
+    TileGeometry {
+        logical: (x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32),
+        pixels: RectPx::new(px, py, pr - px as u32, pb - py as u32),
+        source: (
+            left - px as f64,
+            top - py as f64,
+            right - left,
+            bottom - top,
+        ),
+    }
+}
+
 impl Scene {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        connection: &Connection,
         compositor: CompositorState,
         subcompositor: SubcompositorState,
         viewporter: WpViewporter,
@@ -430,7 +521,7 @@ impl Scene {
         let menu = panel()?;
         let caret = plane()?;
         let error = panel()?;
-        let tiles = Tiles::new(shm, logical, scale, step)?;
+        let tiles = Tiles::new(shm, connection.display(), logical, scale, step)?;
         Ok(Self {
             logical,
             physical,
@@ -487,18 +578,24 @@ impl Scene {
         )
     }
 
-    pub fn tile_released(&mut self, slot: usize) {
-        self.tiles.released(slot);
+    pub fn tile_released(&mut self, slot: usize, qh: &QueueHandle<NativeEditor>) {
+        self.tiles.released(slot, qh);
+    }
+
+    pub fn tile_retired(&mut self, slot: usize) {
+        self.tiles.reclaim(slot);
     }
 
     /// 标记物理像素范围内的标注瓦片需要重绘。
     pub fn damage(&mut self, rect: RectPx) {
         let t = &mut self.tiles;
-        let size = t.logical as f32 * self.scale;
-        let x0 = (rect.x.max(0) as f32 / size).floor() as u32;
-        let y0 = (rect.y.max(0) as f32 / size).floor() as u32;
-        let x1 = ((rect.right().max(0) as f32 / size).ceil() as u32).min(t.cols);
-        let y1 = ((rect.bottom().max(0) as f32 / size).ceil() as u32).min(t.rows);
+        let sx = t.logical as f64 * self.physical.0 as f64 / self.logical.0 as f64;
+        let sy = t.logical as f64 * self.physical.1 as f64 / self.logical.1 as f64;
+        // 四周采样边距也受相邻笔迹影响，损伤范围相应扩大 1 个物理像素。
+        let x0 = (rect.x.saturating_sub(1).max(0) as f64 / sx).floor() as u32;
+        let y0 = (rect.y.saturating_sub(1).max(0) as f64 / sy).floor() as u32;
+        let x1 = ((rect.right().saturating_add(1).max(0) as f64 / sx).ceil() as u32).min(t.cols);
+        let y1 = ((rect.bottom().saturating_add(1).max(0) as f64 / sy).ceil() as u32).min(t.rows);
         for row in y0..y1 {
             for col in x0..x1 {
                 t.pending.insert((row * t.cols + col) as usize);
@@ -506,25 +603,8 @@ impl Scene {
         }
     }
 
-    fn tile_rects(&self, index: usize) -> (IRect, RectPx) {
-        let t = &self.tiles;
-        let (col, row) = (index as u32 % t.cols, index as u32 / t.cols);
-        let lx0 = col * t.logical;
-        let ly0 = row * t.logical;
-        let lx1 = ((col + 1) * t.logical).min(self.logical.0);
-        let ly1 = ((row + 1) * t.logical).min(self.logical.1);
-        let px = |v: u32, limit: u32| ((v as f32 * self.scale).round() as u32).min(limit);
-        let (px0, py0) = (px(lx0, self.physical.0), px(ly0, self.physical.1));
-        let (px1, py1) = (px(lx1, self.physical.0), px(ly1, self.physical.1));
-        (
-            (
-                lx0 as i32,
-                ly0 as i32,
-                (lx1 - lx0) as i32,
-                (ly1 - ly0) as i32,
-            ),
-            RectPx::new(px0 as i32, py0 as i32, px1 - px0, py1 - py0),
-        )
+    fn tile_rects(&self, index: usize) -> TileGeometry {
+        tile_geometry(self.logical, self.physical, self.tiles.logical, index)
     }
 }
 
@@ -561,8 +641,10 @@ impl Scene {
             marks,
             source,
             fonts,
+            preview,
             caret,
         } = input;
+        self.tiles.preview = preview;
         let s = native_ui::logical_selection(selection, self.physical, self.logical);
         let mut changed = self.place_selection(s);
         let mut complete = true;
@@ -696,6 +778,16 @@ impl Scene {
             }
         }
         complete &= self.tiles.pending.is_empty();
+        if !preview {
+            for slot in 0..self.tiles.slots.len() {
+                let attached = self.tiles.tiles[slot / 2]
+                    .as_ref()
+                    .and_then(|tile| tile.attached);
+                if attached != Some(slot) {
+                    self.tiles.release_slot(slot, qh);
+                }
+            }
+        }
         Ok((changed, complete))
     }
 
@@ -754,7 +846,11 @@ impl Scene {
         fonts: &mut Fonts,
         qh: &QueueHandle<NativeEditor>,
     ) -> Result<Option<bool>, String> {
-        let (logical, physical) = self.tile_rects(index);
+        let TileGeometry {
+            logical,
+            pixels: physical,
+            source: (source_x, source_y, source_w, source_h),
+        } = self.tile_rects(index);
         if physical.width == 0 || physical.height == 0 {
             return Ok(Some(false));
         }
@@ -764,14 +860,16 @@ impl Scene {
                 .is_some()
         });
         if !hit {
-            return Ok(Some(self.clear_tile(index)));
+            return Ok(Some(self.clear_tile(index, qh)));
         }
         let attached = self.tiles.tiles[index]
             .as_ref()
             .and_then(|tile| tile.attached);
-        let Some(slot) = (index * 2..index * 2 + 2)
-            .find(|&slot| !self.tiles.slots[slot].busy && Some(slot) != attached)
-        else {
+        let Some(slot) = (index * 2..index * 2 + 2).find(|&slot| {
+            !self.tiles.slots[slot].busy
+                && !self.tiles.slots[slot].retiring
+                && Some(slot) != attached
+        }) else {
             return Ok(None);
         };
         let (w, h) = (physical.width, physical.height);
@@ -791,8 +889,10 @@ impl Scene {
         };
         self.tiles.slots[slot].resident = true;
         if empty {
-            self.tiles.release_slot(slot);
-            return Ok(Some(self.clear_tile(index)));
+            if !self.tiles.preview || self.tiles.slots[slot].buffer.is_none() {
+                self.tiles.release_slot(slot, qh);
+            }
+            return Ok(Some(self.clear_tile(index, qh)));
         }
         if self.tiles.tiles[index].is_none() {
             let plane = Plane::new(
@@ -826,6 +926,10 @@ impl Scene {
         tile.plane.surface.attach(Some(&buffer), 0, 0);
         tile.plane.surface.damage_buffer(0, 0, w as i32, h as i32);
         if !tile.plane.shown {
+            // 以整屏的同一套物理坐标采样，不能分别把每个取整后的瓦片拉伸。
+            tile.plane
+                .viewport
+                .set_source(source_x, source_y, source_w, source_h);
             tile.plane.viewport.set_destination(logical.2, logical.3);
             tile.plane.geometry.2 = logical.2;
             tile.plane.geometry.3 = logical.3;
@@ -838,17 +942,58 @@ impl Scene {
         Ok(Some(true))
     }
 
-    fn clear_tile(&mut self, index: usize) -> bool {
+    fn clear_tile(&mut self, index: usize, qh: &QueueHandle<NativeEditor>) -> bool {
         let Some(tile) = self.tiles.tiles[index].as_mut() else {
             return false;
         };
         let changed = tile.plane.hide();
         tile.attached = None;
-        for slot in index * 2..index * 2 + 2 {
-            if !self.tiles.slots[slot].busy && self.tiles.slots[slot].resident {
-                self.tiles.release_slot(slot);
+        if !self.tiles.preview {
+            for slot in index * 2..index * 2 + 2 {
+                self.tiles.release_slot(slot, qh);
             }
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fractional_tiles_share_quantized_edges_and_keep_sampling_pixels() {
+        for (logical, physical) in [
+            ((1867u32, 1167u32), (2240u32, 1400u32)),
+            ((2048, 1152), (2560, 1440)),
+            ((1024, 640), (1280, 800)),
+            ((2560, 1440), (2560, 1440)),
+        ] {
+            let size = 215;
+            let cols = logical.0.div_ceil(size);
+            let rows = logical.1.div_ceil(size);
+            for index in 0..(cols * rows) as usize {
+                let t = tile_geometry(logical, physical, size, index);
+                let (x, y, w, h) = t.source;
+                assert!(x >= 0.0 && y >= 0.0);
+                assert!(x + w <= f64::from(t.pixels.width));
+                assert!(y + h <= f64::from(t.pixels.height));
+                assert!(t.pixels.x >= 0 && t.pixels.y >= 0);
+                assert!(t.pixels.right() <= physical.0 as i32);
+                assert!(t.pixels.bottom() <= physical.1 as i32);
+                if index as u32 % cols + 1 < cols {
+                    let next = tile_geometry(logical, physical, size, index + 1);
+                    let right = f64::from(t.pixels.x) + x + w;
+                    let left = f64::from(next.pixels.x) + next.source.0;
+                    assert_eq!(right, left, "horizontal seam at {index}");
+                }
+                if index as u32 / cols + 1 < rows {
+                    let next = tile_geometry(logical, physical, size, index + cols as usize);
+                    let bottom = f64::from(t.pixels.y) + y + h;
+                    let top = f64::from(next.pixels.y) + next.source.1;
+                    assert_eq!(bottom, top, "vertical seam at {index}");
+                }
+            }
+        }
     }
 }

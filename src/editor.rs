@@ -2,8 +2,9 @@
 //!
 //! 内存模型：截图 memfd 是唯一的整屏像素副本，同时用于显示与导出；界面控件和
 //! 标注瓦片只占用各自的小缓冲区，标注历史只保存矢量命令。
-use crate::scene::{Scene, SceneInput, TileSlot};
+use crate::scene::{RetiredSlot, Scene, SceneInput, TileSlot};
 use babry::{
+    compositor::{self, Backend, BoundOutput},
     config,
     core::RectPx,
     export,
@@ -14,11 +15,11 @@ use babry::{
     smart_select,
 };
 use smithay_client_toolkit::reexports::client::{
-    Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
-    globals::{GlobalList, registry_queue_init},
+    Connection, Dispatch, QueueHandle, delegate_noop,
+    globals::registry_queue_init,
     protocol::{
         wl_buffer::{self, WlBuffer},
-        wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm_pool, wl_surface,
+        wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm_pool, wl_surface,
     },
 };
 use smithay_client_toolkit::reexports::protocols::wp::{
@@ -141,6 +142,9 @@ pub struct NativeEditor {
     ime_focus: bool,
     ime_enabled: bool,
     ime_cursor: Option<(i32, i32, i32, i32)>,
+    /// KWin 的输入法窗口位于 Overlay 层，输入时将编辑器临时降到 Top 层。
+    kde: bool,
+    ime_layer: bool,
     preedit: String,
     ime_pending: (Option<String>, Option<String>),
     modifiers: Modifiers,
@@ -155,7 +159,7 @@ pub struct NativeEditor {
     exit: bool,
     started: Instant,
     presented: bool,
-    _probe: Option<(EventQueue<OutputProbe>, OutputProbe, wl_output::WlOutput)>,
+    _output: Option<BoundOutput>,
 }
 
 impl NativeEditor {
@@ -183,11 +187,11 @@ impl NativeEditor {
         let registry_state = RegistryState::new(&globals);
         let seat_state = SeatState::new(&globals, &qh);
         // 把覆盖层绑定到截图所在的输出，多显示器时不会出现在错误屏幕。
-        let probe = session
+        let output = session
             .output
             .as_deref()
-            .and_then(|name| OutputProbe::find(&connection, &globals, name));
-        let output = probe.as_ref().map(|(_, _, output)| output.clone());
+            .map(|name| compositor::bind_output(&connection, name))
+            .transpose()?;
         let surface = compositor.create_surface(&qh);
         let viewport = viewporter.get_viewport(&surface, &qh, ());
         let layer = shell.create_layer_surface(
@@ -195,7 +199,7 @@ impl NativeEditor {
             surface,
             Layer::Overlay,
             Some("babry"),
-            output.as_ref(),
+            output.as_ref().map(|binding| &binding.output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
@@ -241,6 +245,8 @@ impl NativeEditor {
             ime_focus: false,
             ime_enabled: false,
             ime_cursor: None,
+            kde: Backend::detect().ok() == Some(Backend::Kde),
+            ime_layer: false,
             preedit: String::new(),
             ime_pending: (None, None),
             modifiers: Modifiers::default(),
@@ -254,7 +260,7 @@ impl NativeEditor {
             exit: false,
             started,
             presented: false,
-            _probe: probe,
+            _output: output,
         };
         while !editor.exit {
             queue
@@ -264,55 +270,6 @@ impl NativeEditor {
         }
         Ok(())
     }
-}
-
-/// 独立事件队列上的输出探测，只用于在创建覆盖层前按名称找到 wl_output。
-pub struct OutputProbe {
-    registry: RegistryState,
-    outputs: OutputState,
-}
-
-impl OutputProbe {
-    fn find(
-        connection: &Connection,
-        globals: &GlobalList,
-        name: &str,
-    ) -> Option<(EventQueue<Self>, Self, wl_output::WlOutput)> {
-        let mut queue = connection.new_event_queue::<Self>();
-        let qh = queue.handle();
-        let mut probe = Self {
-            registry: RegistryState::new(globals),
-            outputs: OutputState::new(globals, &qh),
-        };
-        queue.roundtrip(&mut probe).ok()?;
-        queue.roundtrip(&mut probe).ok()?;
-        let output = probe.outputs.outputs().find(|output| {
-            probe
-                .outputs
-                .info(output)
-                .and_then(|info| info.name)
-                .as_deref()
-                == Some(name)
-        })?;
-        Some((queue, probe, output))
-    }
-}
-
-impl OutputHandler for OutputProbe {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.outputs
-    }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-}
-delegate_output!(OutputProbe);
-delegate_registry!(OutputProbe);
-impl ProvidesRegistryState for OutputProbe {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
-    }
-    registry_handlers![OutputState];
 }
 
 impl NativeEditor {
@@ -349,6 +306,7 @@ impl NativeEditor {
                 marks: &self.marks,
                 source: &self.source,
                 fonts: &mut self.fonts,
+                preview: has_pending,
                 caret,
             },
             qh,
@@ -617,6 +575,14 @@ impl NativeEditor {
 
     /// 文字编辑期间启用输入法，并把光标矩形（表面逻辑坐标）告诉输入法定位候选窗。
     fn sync_ime(&mut self, caret: Option<RectPx>) {
+        let lower = self.kde && self.text_editing && self.ime_focus;
+        if lower != self.ime_layer {
+            self.layer
+                .set_layer(if lower { Layer::Top } else { Layer::Overlay });
+            self.ime_layer = lower;
+            // 同步主表面状态，输入法候选窗和状态提示始终显示在编辑器上方。
+            self.layer.commit();
+        }
         let Some(text_input) = &self.text_input else {
             return;
         };
@@ -845,11 +811,8 @@ impl NativeEditor {
     }
 
     fn cursor_for(&self, position: (f64, f64)) -> Shape {
-        if !self.ui.editing && !matches!(self.pointer_drag, Some(PointerDrag::Resize { .. })) {
-            let edge = selection_edge(self.ui_selection(), position);
-            if edge == 0 || matches!(self.pointer_drag, Some(PointerDrag::Select { .. })) {
-                return Shape::Crosshair;
-            }
+        if !self.ui.editing {
+            return Shape::Crosshair;
         }
         if let Some(PointerDrag::Move { .. }) = self.pointer_drag {
             return Shape::Grabbing;
@@ -961,21 +924,14 @@ impl NativeEditor {
             self.dirty = true;
             return;
         }
-        let edge = selection_edge(selected, position);
         if !self.ui.editing {
             self.hovered = true;
-            // 选区阶段也可以直接拖动当前候选的边或角微调。
-            self.pointer_drag = Some(if edge != 0 {
-                PointerDrag::Resize {
-                    start: position,
-                    origin: self.selection,
-                    edge,
-                }
-            } else {
-                PointerDrag::Select { start: position }
-            });
+            // 悬停候选边缘可能恰好经过指针；框选阶段拖动必须优先手动接管，
+            // 不能因此变成拉伸候选框。确认后各工具状态仍可拖边/角微调。
+            self.pointer_drag = Some(PointerDrag::Select { start: position });
             return;
         }
+        let edge = selection_edge(selected, position);
         if edge != 0 {
             self.commit_pending();
             self.pointer_drag = Some(PointerDrag::Resize {
@@ -1415,7 +1371,7 @@ impl LayerShellHandler for NativeEditor {
     }
     fn configure(
         &mut self,
-        _: &Connection,
+        connection: &Connection,
         qh: &QueueHandle<Self>,
         _: &LayerSurface,
         configure: LayerSurfaceConfigure,
@@ -1434,6 +1390,7 @@ impl LayerShellHandler for NativeEditor {
             return;
         };
         match Scene::new(
+            connection,
             compositor,
             subcompositor,
             viewporter,
@@ -1474,13 +1431,29 @@ impl Dispatch<WlBuffer, TileSlot> for NativeEditor {
         event: wl_buffer::Event,
         slot: &TileSlot,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         if let wl_buffer::Event::Release = event
             && let Some(scene) = state.scene.as_mut()
         {
-            scene.tile_released(slot.0);
+            scene.tile_released(slot.0, qh);
             // 之前因槽位占用而推迟的瓦片在 release 后重试。
+            state.dirty = true;
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, RetiredSlot> for NativeEditor {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        slot: &RetiredSlot,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let Some(scene) = state.scene.as_mut() {
+            scene.tile_retired(slot.0);
             state.dirty = true;
         }
     }

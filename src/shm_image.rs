@@ -200,6 +200,78 @@ impl ShmImage {
         self.alpha = !opaque;
     }
 
+    /// 把原始输出方向还原为用户看到的方向。先按 90 度顺时针旋转，再水平翻转，
+    /// 对应 screencopy 的 wl_output.transform；y_invert 已由 normalize 单独处理。
+    /// 使用原映射原地置换，奇数次旋转只需每像素 1 bit 的访问标记，不再分配整帧。
+    pub fn orient(&mut self, turns: u32, flipped: bool) {
+        let turns = turns % 4;
+        if turns == 0 && !flipped {
+            return;
+        }
+        let (width, height) = (self.width as usize, self.height as usize);
+        let packed_stride = width * 4;
+        if self.stride as usize != packed_stride {
+            for y in 0..height {
+                let start = y * self.stride as usize;
+                self.map
+                    .copy_within(start..start + packed_stride, y * packed_stride);
+            }
+        }
+        let (out_width, out_height) = if turns % 2 == 1 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        let destination = |index: usize| {
+            let (x, y) = (index % width, index / width);
+            let (mut x, y) = match turns {
+                1 => (height - 1 - y, x),
+                2 => (width - 1 - x, height - 1 - y),
+                3 => (y, width - 1 - x),
+                _ => (x, y),
+            };
+            if flipped {
+                x = out_width - 1 - x;
+            }
+            y * out_width + x
+        };
+        let count = width * height;
+        if turns.is_multiple_of(2) {
+            // 翻转和 180 度旋转是对合置换，无需访问标记。
+            for i in 0..count {
+                let j = destination(i);
+                if i < j {
+                    for channel in 0..4 {
+                        self.map.swap(i * 4 + channel, j * 4 + channel);
+                    }
+                }
+            }
+        } else {
+            let mut visited = vec![0u8; count.div_ceil(8)];
+            for start in 0..count {
+                if visited[start / 8] & (1 << (start % 8)) != 0 {
+                    continue;
+                }
+                let mut at = start;
+                let mut pixel: [u8; 4] = self.map[start * 4..start * 4 + 4].try_into().unwrap();
+                loop {
+                    visited[at / 8] |= 1 << (at % 8);
+                    let next = destination(at);
+                    for (channel, value) in pixel.iter_mut().enumerate() {
+                        std::mem::swap(value, &mut self.map[next * 4 + channel]);
+                    }
+                    at = next;
+                    if at == start {
+                        break;
+                    }
+                }
+            }
+        }
+        self.width = out_width as u32;
+        self.height = out_height as u32;
+        self.stride = self.width * 4;
+    }
+
     /// 读取一个直通 RGBA 像素；越界时返回黑色。
     pub fn rgba(&self, x: u32, y: u32) -> [u8; 4] {
         if x >= self.width || y >= self.height {
@@ -247,6 +319,46 @@ mod tests {
         let mut row = [9u8; 12];
         image.read_row(-1, 0, &mut row);
         assert_eq!(row, [0, 0, 0, 0, 10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn all_output_rotations_and_reflections_preserve_pixels_with_padded_rows() {
+        // 非正方形且带行尾填充，确保 90/270 度不会误用旧 stride 或覆盖未搬走的像素。
+        let expected: [&[u8]; 8] = [
+            &[1, 2, 3, 4, 5, 6],
+            &[4, 1, 5, 2, 6, 3],
+            &[6, 5, 4, 3, 2, 1],
+            &[3, 6, 2, 5, 1, 4],
+            &[3, 2, 1, 6, 5, 4],
+            &[1, 4, 2, 5, 3, 6],
+            &[4, 5, 6, 1, 2, 3],
+            &[6, 3, 5, 2, 4, 1],
+        ];
+        for transform in 0..8 {
+            let mut image = ShmImage::new(3, 2, 16).unwrap();
+            image.bytes_mut().fill(0xee);
+            for i in 0..6 {
+                let offset = (i / 3) * 16 + (i % 3) * 4;
+                image.bytes_mut()[offset..offset + 4].copy_from_slice(&[0, 0, i as u8 + 1, 255]);
+            }
+            image.orient(transform % 4, transform >= 4);
+            assert_eq!(
+                (image.width(), image.height()),
+                if transform % 2 == 0 { (3, 2) } else { (2, 3) }
+            );
+            let mut pixels = Vec::new();
+            for y in 0..image.height() {
+                for x in 0..image.width() {
+                    let pixel = image.rgba(x, y);
+                    assert_eq!(pixel[3], 255);
+                    pixels.push(pixel[0]);
+                }
+            }
+            assert_eq!(
+                pixels, expected[transform as usize],
+                "transform {transform}"
+            );
+        }
     }
 
     #[test]

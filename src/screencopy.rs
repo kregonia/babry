@@ -6,7 +6,12 @@ use smithay_client_toolkit::reexports::{
     client::{
         Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop,
         globals::registry_queue_init,
-        protocol::{wl_buffer::WlBuffer, wl_output::WlOutput, wl_shm, wl_shm_pool::WlShmPool},
+        protocol::{
+            wl_buffer::WlBuffer,
+            wl_output::{self, WlOutput},
+            wl_shm,
+            wl_shm_pool::WlShmPool,
+        },
     },
     protocols_wlr::screencopy::v1::client::{
         zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
@@ -46,6 +51,7 @@ struct CaptureState {
     pool: Option<WlShmPool>,
     buffer: Option<WlBuffer>,
     y_invert: bool,
+    transform: wl_output::Transform,
     error: Option<String>,
     done: bool,
 }
@@ -132,6 +138,7 @@ impl CaptureState {
         };
         let (channels, opaque) = order(info.format).unwrap_or((ChannelOrder::Bgra, true));
         image.normalize(channels, opaque, self.y_invert);
+        image.orient(self.transform as u32 % 4, self.transform as u32 >= 4);
         if let Some(buffer) = self.buffer.take() {
             buffer.destroy();
         }
@@ -295,6 +302,7 @@ pub fn capture(output_name: Option<&str>) -> Result<ShmImage, String> {
         pool: None,
         buffer: None,
         y_invert: false,
+        transform: wl_output::Transform::Normal,
         error: None,
         done: false,
     };
@@ -306,6 +314,11 @@ pub fn capture(output_name: Option<&str>) -> Result<ShmImage, String> {
         .roundtrip(&mut state)
         .map_err(|error| format!("Wayland 输出信息不完整: {error}"))?;
     let output = state.output(output_name)?;
+    state.transform = state
+        .output_state
+        .info(&output)
+        .map(|info| info.transform)
+        .unwrap_or(wl_output::Transform::Normal);
     manager.capture_output(0, &output, &qh, ());
     let deadline = Instant::now() + CAPTURE_TIMEOUT;
     while !state.done {

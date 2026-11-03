@@ -209,7 +209,7 @@ exec-once = babry --daemon
 2. 滚轮向上：扩大到父区域；向下：缩小到鼠标所在的子区域。
 3. 单击：确认当前候选，包括滚轮选择的层级，进入编辑阶段。
 4. 按住拖动：移动超过 3px 后切换为手动框选；松开后确认区域。
-5. 选区边框或角点：在选区阶段也可以直接拖动调整边界，悬停时显示对应缩放光标。
+5. 确认选区后，拖动边框或角点微调大小；选区阶段拖动始终进入手动框选，避免智能候选边缘抢走操作。
 6. `Esc`：取消截图。
 
 CV 分析在每次截图时由后台线程执行一次，悬停不会重新处理整张图像；等待期间可以直接拖动框选。选区评分优先考虑方向边界的连续性，降低文字碎片和不规则纹理的优先级；高分屏候选会在原始截图上精修边界。
@@ -260,7 +260,7 @@ babry --output DP-1 --pin image.png
 ### KDE Plasma 6.8+
 
 - 截图走 KWin 自带的 `org.kde.KWin.ScreenShot2`（Spectacle 同款），像素经 pipe 直接读入共享内存。
-- 编辑器是 layer-shell Overlay 层，覆盖桌面和面板，不出现在任务栏或 Alt+Tab 中。
+- 编辑器使用 layer-shell 覆盖桌面和面板，不出现在任务栏或 Alt+Tab 中。中文输入期间临时切换到 Top 层，让 KWin 的输入法候选窗和状态提示显示在编辑器上方，结束输入后恢复 Overlay 层。
 - Plasma 6.8 之前的 ScreenShot2 需要桌面文件声明 `X-KDE-DBUS-Restricted-Interfaces`，Babry 暂不支持这些版本。
 - KWin 在锁屏/熄屏期间返回黑帧，属安全行为，与 XDG Portal 一致。
 
@@ -347,7 +347,16 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 ```
 
-测试覆盖 CLI、保存目录配置、后台协议、memfd 图像的通道规范化与翻转、标注图层（橡皮擦顺序、图形内部透明、瓦片与整图渲染的效果一致性）、跨条带的流式 PNG 导出、智能选区的层级切换与窗口种子吸附，以及贴图边缘判定。
+测试覆盖 CLI、保存目录配置、后台协议、memfd 图像的通道规范化与八种输出旋转/翻转、标注图层（橡皮擦顺序、图形内部透明、瓦片与整图渲染的效果一致性）、分数缩放瓦片边界、跨条带的流式 PNG 导出、智能选区的层级切换与窗口种子吸附，以及贴图边缘判定。
+
+真实 Wayland 回归测试位于 `tests/wayland_editor.rs`，会发送鼠标和按键事件，因此默认忽略。请在专门的 KDE/niri 测试会话中串行执行：
+
+```bash
+BABRY_TEST_ARTIFACTS=/tmp/babry-wayland-tests \
+  cargo test --test wayland_editor -- --ignored --test-threads=1 --nocapture
+```
+
+测试检查长笔画跨瓦片连续性、矩形缩回后无旧轮廓、预览与 PNG 中的标注位置、手动选区、工具菜单、复制 PNG、贴图和 Esc。KDE 上还使用 fcitx5 拼音输入，检查候选框可见与中文导出。KWin 可用 `KWIN_DISABLE_UDMABUF_IMPORT=0` 启动以覆盖共享内存 DMA-BUF 导入路径；`BABRY_TEST_BINARY` 可指定旧版二进制验证回归测试确实能够复现故障。
 
 ### 启动与内存
 

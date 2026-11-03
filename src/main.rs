@@ -28,7 +28,8 @@ fn main() -> Result<(), String> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            // 通知服务可能不可用；错误返回不能等待通知的 D-Bus 调用。
+            .spawn();
         eprintln!("babry: {error}");
         return Err(error);
     }

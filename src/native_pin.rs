@@ -99,7 +99,14 @@ pub fn run_surface(path: &Path, output: Option<String>) -> Result<(), String> {
     let surface = compositor.create_surface(&qh);
     let viewport = viewporter.get_viewport(&surface, &qh, ());
     viewport.set_destination(width as i32, height as i32);
-    let layer = shell.create_layer_surface(&qh, surface, Layer::Top, Some("babry-pin"), None);
+    let bound_output = compositor::bind_output(&connection, &selected.name)?;
+    let layer = shell.create_layer_surface(
+        &qh,
+        surface,
+        Layer::Top,
+        Some("babry-pin"),
+        Some(&bound_output.output),
+    );
     layer.set_anchor(Anchor::TOP | Anchor::LEFT);
     layer.set_size(width, height);
     layer.set_margin(y, 0, 0, x);
@@ -133,6 +140,7 @@ pub fn run_surface(path: &Path, output: Option<String>) -> Result<(), String> {
         _pool: pool,
         buffer,
         _image: image,
+        _output: bound_output,
         x,
         y,
         width,
@@ -169,6 +177,7 @@ struct Pin {
     _pool: wl_shm_pool::WlShmPool,
     buffer: WlBuffer,
     _image: ShmImage,
+    _output: compositor::BoundOutput,
     x: i32,
     y: i32,
     width: u32,

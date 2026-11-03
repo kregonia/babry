@@ -2,7 +2,7 @@
 use crate::core::RectPx;
 use serde_json::Value;
 use smithay_client_toolkit::reexports::client::{
-    Connection, QueueHandle,
+    Connection, EventQueue, QueueHandle,
     globals::registry_queue_init,
     protocol::wl_output::{Transform, WlOutput},
 };
@@ -156,6 +156,43 @@ impl ProvidesRegistryState for Probe {
     }
     registry_handlers![OutputState];
 }
+/// 在当前连接上按名称绑定输出，并持有事件队列直到表面退出。
+/// 编辑器和贴图必须使用同一个目标输出，不能依赖合成器的默认输出选择。
+pub struct BoundOutput {
+    pub output: WlOutput,
+    _queue: EventQueue<Probe>,
+    _state: Probe,
+}
+
+pub fn bind_output(connection: &Connection, name: &str) -> Result<BoundOutput, String> {
+    let (globals, mut queue) =
+        registry_queue_init::<Probe>(connection).map_err(|e| e.to_string())?;
+    let qh = queue.handle();
+    let mut state = Probe {
+        registry: RegistryState::new(&globals),
+        outputs: OutputState::new(&globals, &qh),
+    };
+    queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+    queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
+    let output = state
+        .outputs
+        .outputs()
+        .find(|output| {
+            state
+                .outputs
+                .info(output)
+                .and_then(|info| info.name)
+                .as_deref()
+                == Some(name)
+        })
+        .ok_or_else(|| format!("显示器 {name} 不存在或未启用"))?;
+    Ok(BoundOutput {
+        output,
+        _queue: queue,
+        _state: state,
+    })
+}
+
 pub fn outputs() -> Result<Vec<OutputInfo>, String> {
     let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
     let (globals, mut queue) = registry_queue_init::<Probe>(&conn).map_err(|e| e.to_string())?;
