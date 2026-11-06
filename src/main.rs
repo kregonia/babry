@@ -18,6 +18,26 @@ use std::{
 mod editor;
 mod scene;
 
+/// glibc 2.43 把 `acosf` 的默认符号版本提升到了 2.43；自己实现可避免发布二进制
+/// 只能运行在最新发行版。用 atan2 而不是 `f64::acos`，防止 LTO 把它折回 `acosf`。
+#[cfg(target_env = "gnu")]
+#[unsafe(no_mangle)]
+extern "C" fn acosf(x: f32) -> f32 {
+    if x.abs() > 1.0 {
+        return f32::NAN;
+    }
+    let (x, root) = (
+        f64::from(x),
+        (1.0 - f64::from(x) * f64::from(x)).max(0.0).sqrt(),
+    );
+    let angle = if x >= 0.0 {
+        root.atan2(x)
+    } else {
+        std::f64::consts::PI - root.atan2(-x)
+    };
+    angle as f32
+}
+
 #[path = "daemon.rs"]
 mod daemon;
 
@@ -365,4 +385,23 @@ fn run_daemon() -> Result<(), String> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn acosf_compat_wrapper_matches_double_precision_reference() {
+        for x in [-1.0_f32, -0.75, -0.25, -0.0, 0.25, 0.5, 0.999, 1.0] {
+            // f64::acos 走 libm 的 acos，不会被本文件的 acosf 覆盖。
+            let reference = f64::from(x).acos() as f32;
+            assert!(
+                (super::acosf(x) - reference).abs() < 1e-6,
+                "acosf({x}) = {} != {reference}",
+                super::acosf(x)
+            );
+        }
+        assert!(super::acosf(1.5).is_nan());
+        assert!(super::acosf(-1.5).is_nan());
+    }
 }
