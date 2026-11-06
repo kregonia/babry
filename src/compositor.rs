@@ -247,6 +247,119 @@ pub fn outputs() -> Result<Vec<OutputInfo>, String> {
         })
         .collect())
 }
+/// niri 26.04 的平铺窗口不返回 `tile_pos_in_workspace_view`（只有浮动窗口和新版
+/// niri 才返回），因此必须用列/行索引、tile 尺寸和焦点列居中重建可见几何。
+#[derive(Clone, Copy, Debug)]
+struct NiriTile {
+    column: usize,
+    row: usize,
+    width: f64,
+    height: f64,
+    /// 窗口内容相对 tile 的偏移和尺寸，用于浮动/全屏窗口的内部内容区域。
+    offset: (f64, f64),
+    window: (f64, f64),
+    exact: Option<(f64, f64)>,
+    focused: bool,
+}
+
+fn place_niri_tiles(tiles: &[NiriTile], view: (f64, f64), gap: f64) -> Vec<(f64, f64, f64, f64)> {
+    let mut placed = vec![(0.0, 0.0, 0.0, 0.0); tiles.len()];
+    if tiles.is_empty() {
+        return placed;
+    }
+    let mut complete = true;
+    for (slot, tile) in placed.iter_mut().zip(tiles) {
+        match tile.exact {
+            Some((x, y)) => *slot = (x, y, tile.width, tile.height),
+            None => complete = false,
+        }
+    }
+    if complete {
+        return placed;
+    }
+    // 浮动窗口有精确位置，只重建没有位置的平铺窗口；锚点必须是平铺焦点窗口。
+    let anchor = tiles
+        .iter()
+        .position(|tile| tile.focused && tile.exact.is_none())
+        .or_else(|| tiles.iter().position(|tile| tile.exact.is_none()))
+        .unwrap_or(0);
+    let mut columns: Vec<(usize, f64)> = Vec::new();
+    for tile in tiles.iter().filter(|tile| tile.exact.is_none()) {
+        match columns
+            .iter_mut()
+            .find(|(column, _)| *column == tile.column)
+        {
+            Some((_, width)) => *width = width.max(tile.width),
+            None => columns.push((tile.column, tile.width)),
+        }
+    }
+    columns.sort_by_key(|(column, _)| *column);
+    let column_width = |column: usize| {
+        columns
+            .iter()
+            .find(|(c, _)| *c == column)
+            .map(|(_, width)| *width)
+            .unwrap_or(0.0)
+    };
+    // 最高的一列通常占满工作区；用它反推顶栏占掉的逻辑像素。
+    let span = columns
+        .iter()
+        .map(|(column, _)| {
+            let mut rows: Vec<&NiriTile> = tiles
+                .iter()
+                .filter(|tile| tile.exact.is_none() && tile.column == *column)
+                .collect();
+            rows.sort_by_key(|tile| tile.row);
+            rows.iter().map(|tile| tile.height).sum::<f64>()
+                + gap * rows.len().saturating_sub(1) as f64
+        })
+        .fold(0.0, f64::max);
+    let working = (span + 2.0 * gap).min(view.1);
+    let top = view.1 - working;
+    let focus_column = tiles[anchor].column;
+    let focus_width = column_width(focus_column);
+    let focus_x = ((view.0 - focus_width) / 2.0).max(0.0);
+    let focus_index = columns
+        .iter()
+        .position(|(column, _)| *column == focus_column)
+        .unwrap_or(0);
+    let mut xs = vec![0.0; columns.len()];
+    xs[focus_index] = focus_x;
+    for index in (focus_index + 1)..columns.len() {
+        xs[index] = xs[index - 1] + columns[index - 1].1 + gap;
+    }
+    for index in (0..focus_index).rev() {
+        xs[index] = xs[index + 1] - columns[index].1 - gap;
+    }
+    for (index, tile) in tiles.iter().enumerate() {
+        if tile.exact.is_some() {
+            continue;
+        }
+        let column_index = columns
+            .iter()
+            .position(|(column, _)| *column == tile.column)
+            .unwrap_or(0);
+        let mut y = top + gap;
+        let mut rows: Vec<&NiriTile> = tiles
+            .iter()
+            .filter(|row| row.exact.is_none() && row.column == tile.column)
+            .collect();
+        rows.sort_by_key(|row| row.row);
+        for row in rows.into_iter().take_while(|row| row.row < tile.row) {
+            y += row.height + gap;
+        }
+        let x = xs[column_index] + (columns[column_index].1 - tile.width) / 2.0;
+        placed[index] = (x, y, tile.width, tile.height);
+    }
+    // 全屏窗口覆盖整个输出，不参与居中估算。
+    for (index, tile) in tiles.iter().enumerate() {
+        if tile.exact.is_none() && tile.width >= view.0 - 1.0 && tile.height >= view.1 - 1.0 {
+            placed[index] = (0.0, 0.0, view.0, view.1);
+        }
+    }
+    placed
+}
+
 /// 只有合成器公布的可见顶层窗口几何可作为锚点，不假设 IPC 提供应用内部控件。
 pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> {
     let sx = physical.0 as f64 / f64::from(output.width);
@@ -269,10 +382,13 @@ pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> 
             if let Ok(v) = hypr_query("clients")
                 && let Some(list) = v.as_array()
             {
-                for w in list {
-                    if w["hidden"] == true || w["mapped"] == false {
-                        continue;
-                    }
+                // 焦点窗口排在最前，作为默认选择。
+                let mut visible: Vec<&Value> = list
+                    .iter()
+                    .filter(|w| w["hidden"] != true && w["mapped"] != false)
+                    .collect();
+                visible.sort_by_key(|w| w["focused"] != true);
+                for w in visible {
                     if let (Some(x), Some(y), Some(width), Some(height)) = (
                         w["at"][0].as_f64(),
                         w["at"][1].as_f64(),
@@ -293,6 +409,7 @@ pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> 
                         .and_then(|w| w["id"].as_u64())
                 })
             });
+            let mut tiles = Vec::new();
             if let Ok(v) = niri_query("Windows")
                 && let Some(list) = v["Windows"].as_array()
             {
@@ -302,36 +419,71 @@ pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> 
                     }
                     let layout = &window["layout"];
                     let (Some(width), Some(height)) = (
-                        layout["window_size"][0].as_f64(),
-                        layout["window_size"][1].as_f64(),
+                        layout["tile_size"][0].as_f64(),
+                        layout["tile_size"][1].as_f64(),
                     ) else {
                         continue;
                     };
-                    // 新版 niri 给出可见窗口在工作区视图中的逻辑位置。
-                    if let (Some(x), Some(y)) = (
-                        layout["tile_pos_in_workspace_view"][0].as_f64(),
-                        layout["tile_pos_in_workspace_view"][1].as_f64(),
-                    ) {
-                        let dx = layout["window_offset_in_tile"][0].as_f64().unwrap_or(0.0);
-                        let dy = layout["window_offset_in_tile"][1].as_f64().unwrap_or(0.0);
-                        add(
-                            f64::from(output.x) + x + dx,
-                            f64::from(output.y) + y + dy,
-                            width,
-                            height,
-                        );
-                    } else if window["is_focused"] == true {
-                        // 没有位置时 pos_in_scrolling_layout 只是列/行索引；焦点列通常居中，
-                        // 用窗口尺寸估算，再由智能选区吸附到真实边缘。
-                        add(
-                            ((f64::from(output.width) - width).max(0.0)) * 0.5
-                                + f64::from(output.x),
-                            ((f64::from(output.height) - height).max(0.0)) * 0.5
-                                + f64::from(output.y),
-                            width,
-                            height,
-                        );
+                    if width <= 1.0 || height <= 1.0 {
+                        continue;
                     }
+                    let index = |value: &Value, fallback: usize| {
+                        value
+                            .as_array()
+                            .and_then(|pair| {
+                                Some((
+                                    pair.first()?.as_u64()? as usize,
+                                    pair.get(1)?.as_u64()? as usize,
+                                ))
+                            })
+                            .unwrap_or((fallback, fallback))
+                    };
+                    let (column, row) = index(&layout["pos_in_scrolling_layout"], 1);
+                    let offset = (
+                        layout["window_offset_in_tile"][0].as_f64().unwrap_or(0.0),
+                        layout["window_offset_in_tile"][1].as_f64().unwrap_or(0.0),
+                    );
+                    let window_size = (
+                        layout["window_size"][0].as_f64().unwrap_or(width),
+                        layout["window_size"][1].as_f64().unwrap_or(height),
+                    );
+                    let exact = layout["tile_pos_in_workspace_view"][0]
+                        .as_f64()
+                        .zip(layout["tile_pos_in_workspace_view"][1].as_f64());
+                    tiles.push(NiriTile {
+                        column,
+                        row,
+                        width,
+                        height,
+                        offset,
+                        window: window_size,
+                        exact,
+                        focused: window["is_focused"] == true,
+                    });
+                }
+            }
+            let placed = place_niri_tiles(
+                &tiles,
+                (f64::from(output.width), f64::from(output.height)),
+                16.0,
+            );
+            let focused = tiles.iter().position(|tile| tile.focused);
+            let order = focused
+                .into_iter()
+                .chain((0..tiles.len()).filter(|index| Some(*index) != focused));
+            let origin = (f64::from(output.x), f64::from(output.y));
+            for index in order {
+                let (x, y, w, h) = placed[index];
+                add(origin.0 + x, origin.1 + y, w, h);
+                // 浮动/全屏窗口在 tile 内有实际内容偏移时，再提供内容区域。
+                let (ox, oy) = tiles[index].offset;
+                let (ww, wh) = tiles[index].window;
+                let differs = ox.abs() > 2.0
+                    || oy.abs() > 2.0
+                    || (ww - w).abs() > 2.0
+                    || (wh - h).abs() > 2.0;
+                if differs && ox >= -1.0 && oy >= -1.0 && ox + ww <= w + 2.0 && oy + wh <= h + 2.0 {
+                    add(origin.0 + x + ox, origin.1 + y + oy, ww, wh);
                 }
             }
         }
@@ -340,3 +492,72 @@ pub fn window_regions(output: &OutputInfo, physical: (u32, u32)) -> Vec<RectPx> 
     rects
 }
 use std::io::Read;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile(column: usize, width: f64, height: f64, focused: bool) -> NiriTile {
+        NiriTile {
+            column,
+            row: 1,
+            width,
+            height,
+            offset: (0.0, 0.0),
+            window: (width, height),
+            exact: None,
+            focused,
+        }
+    }
+
+    #[test]
+    fn niri_reconstruction_centers_focused_column_and_keeps_gaps() {
+        // 与 niri 26.04 的 2048×1152、scale 1.25、gaps 16、默认 2/3 列宽一致。
+        let tiles = vec![
+            tile(1, 1338.4, 1086.4, false),
+            tile(2, 1338.4, 1086.4, true),
+            tile(3, 1338.4, 1086.4, false),
+        ];
+        let placed = place_niri_tiles(&tiles, (2048.0, 1152.0), 16.0);
+        let close = |a: f64, b: f64| (a - b).abs() < 0.6;
+        assert!(close(placed[1].0, 354.8), "{:?}", placed);
+        // 顶栏占 33.6 逻辑像素，上下各留 16。
+        assert!(close(placed[1].1, 49.6), "{:?}", placed);
+        assert!(close(placed[2].0, 354.8 + 1338.4 + 16.0), "{:?}", placed);
+        assert!(close(placed[0].0, 354.8 - 1338.4 - 16.0), "{:?}", placed);
+    }
+
+    #[test]
+    fn niri_exact_positions_are_used_when_all_are_known() {
+        let mut exact = tile(1, 400.0, 300.0, true);
+        exact.exact = Some((120.0, 80.0));
+        let mut second = tile(2, 400.0, 300.0, false);
+        second.exact = Some((536.0, 80.0));
+        let placed = place_niri_tiles(&[exact, second], (1024.0, 768.0), 16.0);
+        assert_eq!(placed[0], (120.0, 80.0, 400.0, 300.0));
+        assert_eq!(placed[1], (536.0, 80.0, 400.0, 300.0));
+    }
+
+    #[test]
+    fn niri_placement_handles_missing_window_list() {
+        assert!(place_niri_tiles(&[], (2048.0, 1152.0), 16.0).is_empty());
+    }
+
+    #[test]
+    fn niri_stacked_rows_are_placed_below_each_other() {
+        let first = tile(1, 400.0, 300.0, true);
+        let mut second = tile(1, 400.0, 300.0, false);
+        second.row = 2;
+        let placed = place_niri_tiles(&[first, second], (1024.0, 768.0), 16.0);
+        assert!(
+            close_enough(placed[1].1, placed[0].1 + 300.0 + 16.0),
+            "{:?}",
+            placed
+        );
+        assert!(close_enough(placed[0].0, placed[1].0));
+    }
+
+    fn close_enough(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.6
+    }
+}

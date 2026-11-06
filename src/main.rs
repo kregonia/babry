@@ -157,11 +157,8 @@ fn capture_session(
             }
             let _ = sender.send(candidates);
         });
-        let selection = seeds
-            .iter()
-            .copied()
-            .max_by_key(|rect| u64::from(rect.width) * u64::from(rect.height))
-            .unwrap_or(full);
+        // 焦点窗口排在最前，首帧直接选中它，而不是面积最大的窗口。
+        let selection = seeds.first().copied().unwrap_or(full);
         (Some(receiver), selection)
     };
     editor::NativeEditor::run(editor::Session {
@@ -178,8 +175,23 @@ fn capture_session(
 /// 离线诊断：输出候选框 JSON 和叠加图，便于在真实截图上评估智能选区。
 fn debug_selection(source: &Path, directory: &Path) -> Result<(), String> {
     let image = babry::shm_image::ShmImage::read_png(source)?;
+    // 调试时如果当前桌面尺寸和图片一致，就用真实窗口几何，复现正式路径。
+    let seeds = compositor::outputs()
+        .ok()
+        .and_then(|outputs| compositor::select_output(&outputs, None).ok())
+        .filter(|output| {
+            let expected = (f64::from(output.width) * f64::from(output.scale)).round() as u32;
+            expected.abs_diff(image.width()) <= 2
+                && (f64::from(output.height) * f64::from(output.scale)).round() as u32
+                    == image.height()
+        })
+        .map(|output| compositor::window_regions(&output, (image.width(), image.height())))
+        .unwrap_or_default();
+    if std::env::var_os("BABRY_TRACE_SELECTION").is_some() {
+        eprintln!("窗口种子: {seeds:?}");
+    }
     let started = Instant::now();
-    let candidates = smart_select::detect(&image, &[]);
+    let candidates = smart_select::detect(&image, &seeds);
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     let list: Vec<_> = candidates
@@ -187,7 +199,7 @@ fn debug_selection(source: &Path, directory: &Path) -> Result<(), String> {
         .map(|c| {
             serde_json::json!({
                 "x": c.rect.x, "y": c.rect.y, "width": c.rect.width, "height": c.rect.height,
-                "quality": c.quality, "seed": c.seed,
+                "quality": c.quality, "seed": c.seed, "primary": c.primary,
             })
         })
         .collect();
@@ -244,7 +256,11 @@ fn debug_selection(source: &Path, directory: &Path) -> Result<(), String> {
         .write_header()
         .and_then(|mut writer| writer.write_image_data(pixmap.data()))
         .map_err(|e| e.to_string())?;
-    println!("{} 个候选，{elapsed:.1}ms", candidates.len());
+    println!(
+        "{} 个候选（{} 个窗口种子），{elapsed:.1}ms",
+        candidates.len(),
+        seeds.len()
+    );
     Ok(())
 }
 

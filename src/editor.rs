@@ -862,8 +862,16 @@ impl NativeEditor {
                     && !self.ui.editing
                     && let Some(seed) = candidates
                         .iter()
-                        .filter(|candidate| candidate.seed)
-                        .max_by_key(|c| u64::from(c.rect.width) * u64::from(c.rect.height))
+                        .find(|candidate| candidate.primary)
+                        .or_else(|| {
+                            candidates
+                                .iter()
+                                .filter(|candidate| candidate.seed)
+                                .max_by_key(|candidate| {
+                                    u64::from(candidate.rect.width)
+                                        * u64::from(candidate.rect.height)
+                                })
+                        })
                 {
                     self.selection = seed.rect;
                     self.dirty = true;

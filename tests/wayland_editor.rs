@@ -14,6 +14,7 @@ use babry::{
     font::Fonts,
     kde, native_ui, screencopy,
     shm_image::ShmImage,
+    smart_select,
 };
 use smithay_client_toolkit::reexports::{
     client::{
@@ -400,4 +401,101 @@ fn preview_survives_buffer_retirement_and_rectangle_remapping() {
         output.height,
         dir.display()
     );
+}
+
+fn contains_rect(outer: RectPx, inner: RectPx) -> bool {
+    outer.x <= inner.x
+        && outer.y <= inner.y
+        && outer.right() >= inner.right()
+        && outer.bottom() >= inner.bottom()
+}
+
+fn newest_export(directory: &Path) -> ShmImage {
+    let newest = std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "png").then_some(path)
+        })
+        .max()
+        .expect("保存目录里应有导出的 PNG");
+    ShmImage::read_png(&newest).unwrap()
+}
+
+fn assert_size(image: &ShmImage, rect: RectPx, label: &str) {
+    let (dw, dh) = (
+        image.width().abs_diff(rect.width),
+        image.height().abs_diff(rect.height),
+    );
+    assert!(
+        dw <= 3 && dh <= 3,
+        "{label}: exported {}x{}, expected {}x{} ({rect:?})",
+        image.width(),
+        image.height(),
+        rect.width,
+        rect.height
+    );
+}
+
+/// niri 26.04 不返回平铺窗口位置；验证用列索引重建的焦点窗口是默认选区，
+/// 且悬停到另一个窗口内的小控件时，导出尺寸真正变成该控件而不是整窗。
+#[test]
+#[ignore = "needs a live niri session with at least two visible windows; saves two PNGs"]
+fn niri_window_seeds_and_inner_candidates_drive_selection() {
+    if Backend::detect().unwrap() != Backend::Niri {
+        eprintln!("skip: not a niri session");
+        return;
+    }
+    let (_temp, dir) = directory("niri-selection");
+    let output = compositor::select_output(&compositor::outputs().unwrap(), None).unwrap();
+    let before = capture(&output.name);
+    let seeds = compositor::window_regions(&output, (before.width(), before.height()));
+    assert!(
+        seeds.len() >= 2,
+        "niri 应给出至少两个可见窗口种子: {seeds:?}"
+    );
+    let candidates = smart_select::detect(&before, &seeds);
+    // 选一个位于非焦点窗口内、足够大的小控件，避免点到窗口边框或整窗。
+    let target = candidates
+        .iter()
+        .filter(|candidate| !candidate.seed && candidate.quality >= 0.8)
+        .filter(|candidate| {
+            (40..=400).contains(&candidate.rect.width)
+                && (24..=240).contains(&candidate.rect.height)
+        })
+        .filter(|candidate| {
+            seeds
+                .iter()
+                .skip(1)
+                .any(|window| contains_rect(*window, candidate.rect))
+        })
+        .min_by_key(|candidate| u64::from(candidate.rect.width) * u64::from(candidate.rect.height))
+        .map(|candidate| candidate.rect)
+        .expect("非焦点窗口内应有小控件候选");
+    println!("焦点窗口 {:?}，悬停目标 {:?}", seeds[0], target);
+
+    let input = Input::new((output.width, output.height));
+    let scale = f64::from(before.width()) / f64::from(output.width);
+    let export = dir.join("export");
+
+    // 1) 首帧默认选中焦点窗口。
+    let mut editor = Editor::start(&dir, false);
+    pause(500);
+    input.key(46, "s", true);
+    editor.wait();
+    assert_size(&newest_export(&export), seeds[0], "initial selection");
+
+    // 2) 悬停到另一个窗口内的小控件，导出应为该控件。
+    let mut editor = Editor::start(&dir, false);
+    pause(500);
+    let center = (
+        f64::from(target.x + target.width as i32 / 2) / scale,
+        f64::from(target.y + target.height as i32 / 2) / scale,
+    );
+    input.move_to(center.0, center.1);
+    pause(300);
+    input.key(46, "s", true);
+    editor.wait();
+    assert_size(&newest_export(&export), target, "hovered candidate");
+    println!("niri 窗口种子与窗口内候选通过: {}", dir.display());
 }
