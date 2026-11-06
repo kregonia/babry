@@ -62,16 +62,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="docs/releases/${GITHUB_REF_NAME}.md"
+          title="babry ${GITHUB_REF_NAME}"
           if test -f "$notes"; then
             notes_args=(--notes-file "$notes")
           else
             notes_args=(--generate-notes)
           fi
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # 标签推送可能已由 GitHub 自动创建空 Release，补齐标题和说明后再传资产。
+            if test -f "$notes"; then
+              gh release edit "$GITHUB_REF_NAME" --title "$title" --notes-file "$notes"
+            else
+              gh release edit "$GITHUB_REF_NAME" --title "$title"
+            fi
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
-              --title "babry ${GITHUB_REF_NAME}" \
+              --title "$title" \
               --verify-tag \
               "${notes_args[@]}"
           fi
