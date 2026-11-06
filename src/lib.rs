@@ -12,3 +12,4 @@ pub mod pixels;
 pub mod screencopy;
 pub mod shm_image;
 pub mod smart_select;
+pub mod stitch;

@@ -157,13 +157,16 @@ pub struct NativeEditor {
     frame_requested: Instant,
     dirty: bool,
     exit: bool,
+    /// 用户点击长截图后记录选区（截图物理像素）；编辑器退出后交给长截图流程。
+    longshot: Option<RectPx>,
     started: Instant,
     presented: bool,
     _output: Option<BoundOutput>,
 }
 
 impl NativeEditor {
-    pub fn run(session: Session) -> Result<(), String> {
+    /// 运行编辑器；返回 `Some(选区)` 表示用户选择对该选区做长截图。
+    pub fn run(session: Session) -> Result<Option<RectPx>, String> {
         let started = Instant::now();
         let connection =
             Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
@@ -258,6 +261,7 @@ impl NativeEditor {
             frame_requested: Instant::now(),
             dirty: true,
             exit: false,
+            longshot: None,
             started,
             presented: false,
             _output: output,
@@ -268,7 +272,7 @@ impl NativeEditor {
                 .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
             editor.draw(&qh)?;
         }
-        Ok(())
+        Ok(editor.longshot)
     }
 }
 
@@ -796,7 +800,12 @@ impl NativeEditor {
                 self.report(result);
             }
             Action::Cancel => self.exit = true,
-            Action::Dismiss | Action::More | Action::Blank => self.ui.menu = None,
+            Action::Longshot => {
+                self.ui.menu = None;
+                self.longshot = Some(self.selection);
+                self.exit = true;
+            }
+            Action::Dismiss | Action::Blank => self.ui.menu = None,
             Action::Grip
             | Action::Width
             | Action::Number

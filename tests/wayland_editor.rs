@@ -7,6 +7,7 @@
 include!("support/workflow.rs");
 include!("support/kde_ime.rs");
 include!("support/daemon.rs");
+include!("support/longshot.rs");
 use babry::{
     compositor::{self, Backend},
     core::RectPx,
@@ -139,6 +140,23 @@ impl Input {
         self.sweep(from, to, steps);
         self.button(0x110, false);
         pause(100);
+    }
+    /// 滚轮向下 `notches` 格（负数向上）。
+    fn scroll(&self, notches: i32) {
+        match &self.device {
+            Device::Kde(input) => input.axis(0, 15.0 * f64::from(notches)),
+            Device::Wlr(input) => {
+                input.axis_source(wl_pointer::AxisSource::Wheel);
+                input.axis_discrete(
+                    0,
+                    wl_pointer::Axis::VerticalScroll,
+                    15.0 * f64::from(notches),
+                    notches,
+                );
+                input.frame();
+            }
+        }
+        self.flush();
     }
     fn key(&self, code: u32, name: &str, ctrl: bool) {
         match &self.device {

@@ -89,6 +89,14 @@ impl CaptureState {
 
     fn fail(&mut self, message: impl Into<String>) {
         self.error = Some(message.into());
+        // 连续取帧时失败的帧也要释放缓冲区，避免长截图期间累积 wl_shm 对象。
+        if let Some(buffer) = self.buffer.take() {
+            buffer.destroy();
+        }
+        if let Some(pool) = self.pool.take() {
+            pool.destroy();
+        }
+        self.image = None;
         self.done = true;
     }
 
@@ -280,59 +288,112 @@ pub fn dispatch_until<S>(
 
 /// 截取一个 wlroots 兼容输出到 memfd 共享图像。
 pub fn capture(output_name: Option<&str>) -> Result<ShmImage, String> {
-    let connection =
-        Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
-    let (globals, mut queue) = registry_queue_init::<CaptureState>(&connection)
-        .map_err(|error| format!("读取 Wayland 全局对象失败: {error}"))?;
-    let qh = queue.handle();
-    let shm: wl_shm::WlShm = globals
-        .bind(&qh, 1..=1, ())
-        .map_err(|error| format!("wl_shm 不可用: {error}"))?;
-    let manager: ZwlrScreencopyManagerV1 = globals
-        .bind(&qh, 1..=3, GlobalData)
-        .map_err(|error| format!("screencopy 协议不可用: {error}"))?;
-    let mut state = CaptureState {
-        registry_state: RegistryState::new(&globals),
-        output_state: OutputState::new(&globals, &qh),
-        shm,
-        version: Proxy::version(&manager),
-        formats: Vec::new(),
-        chosen: None,
-        image: None,
-        pool: None,
-        buffer: None,
-        y_invert: false,
-        transform: wl_output::Transform::Normal,
-        error: None,
-        done: false,
-    };
-    // 第一次往返得到 wl_output，第二次得到名称等输出信息。
-    queue
-        .roundtrip(&mut state)
-        .map_err(|error| format!("Wayland 输出查询失败: {error}"))?;
-    queue
-        .roundtrip(&mut state)
-        .map_err(|error| format!("Wayland 输出信息不完整: {error}"))?;
-    let output = state.output(output_name)?;
-    state.transform = state
-        .output_state
-        .info(&output)
-        .map(|info| info.transform)
-        .unwrap_or(wl_output::Transform::Normal);
-    manager.capture_output(0, &output, &qh, ());
-    let deadline = Instant::now() + CAPTURE_TIMEOUT;
-    while !state.done {
-        if !dispatch_until(&mut queue, &mut state, deadline)? && Instant::now() >= deadline {
-            return Err("screencopy 超时：合成器 5 秒内没有返回截图".into());
+    let mut grabber = Grabber::new(output_name, None)?;
+    grabber.grab()
+}
+
+/// 可重复截图的 screencopy 连接；长截图在同一连接上按区域连续取帧。
+pub struct Grabber {
+    queue: EventQueue<CaptureState>,
+    state: CaptureState,
+    manager: ZwlrScreencopyManagerV1,
+    output: WlOutput,
+    /// 输出内的逻辑坐标区域；`None` 表示整个输出。
+    region: Option<(i32, i32, i32, i32)>,
+}
+
+impl Grabber {
+    pub fn new(
+        output_name: Option<&str>,
+        region: Option<(i32, i32, i32, i32)>,
+    ) -> Result<Self, String> {
+        let connection =
+            Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
+        let (globals, mut queue) = registry_queue_init::<CaptureState>(&connection)
+            .map_err(|error| format!("读取 Wayland 全局对象失败: {error}"))?;
+        let qh = queue.handle();
+        let shm: wl_shm::WlShm = globals
+            .bind(&qh, 1..=1, ())
+            .map_err(|error| format!("wl_shm 不可用: {error}"))?;
+        let manager: ZwlrScreencopyManagerV1 = globals
+            .bind(&qh, 1..=3, GlobalData)
+            .map_err(|error| format!("screencopy 协议不可用: {error}"))?;
+        let mut state = CaptureState {
+            registry_state: RegistryState::new(&globals),
+            output_state: OutputState::new(&globals, &qh),
+            shm,
+            version: Proxy::version(&manager),
+            formats: Vec::new(),
+            chosen: None,
+            image: None,
+            pool: None,
+            buffer: None,
+            y_invert: false,
+            transform: wl_output::Transform::Normal,
+            error: None,
+            done: false,
+        };
+        // 第一次往返得到 wl_output，第二次得到名称等输出信息。
+        queue
+            .roundtrip(&mut state)
+            .map_err(|error| format!("Wayland 输出查询失败: {error}"))?;
+        queue
+            .roundtrip(&mut state)
+            .map_err(|error| format!("Wayland 输出信息不完整: {error}"))?;
+        let output = state.output(output_name)?;
+        state.transform = state
+            .output_state
+            .info(&output)
+            .map(|info| info.transform)
+            .unwrap_or(wl_output::Transform::Normal);
+        Ok(Self {
+            queue,
+            state,
+            manager,
+            output,
+            region,
+        })
+    }
+
+    /// 截取一帧；每帧使用新的 memfd，返回后调用方独占像素。
+    pub fn grab(&mut self) -> Result<ShmImage, String> {
+        let state = &mut self.state;
+        state.formats.clear();
+        state.chosen = None;
+        state.image = None;
+        state.y_invert = false;
+        state.error = None;
+        state.done = false;
+        let qh = self.queue.handle();
+        match self.region {
+            Some((x, y, width, height)) => {
+                self.manager
+                    .capture_output_region(0, &self.output, x, y, width, height, &qh, ())
+            }
+            None => self.manager.capture_output(0, &self.output, &qh, ()),
+        };
+        let deadline = Instant::now() + CAPTURE_TIMEOUT;
+        while !self.state.done {
+            if !dispatch_until(&mut self.queue, &mut self.state, deadline)?
+                && Instant::now() >= deadline
+            {
+                return Err("screencopy 超时：合成器 5 秒内没有返回截图".into());
+            }
+        }
+        match self.state.error.take() {
+            Some(error) => Err(error),
+            None => self
+                .state
+                .image
+                .take()
+                .ok_or_else(|| "screencopy 没有返回像素".into()),
         }
     }
-    manager.destroy();
-    let _ = queue.roundtrip(&mut state);
-    match state.error {
-        Some(error) => Err(error),
-        None => state
-            .image
-            .take()
-            .ok_or_else(|| "screencopy 没有返回像素".into()),
+}
+
+impl Drop for Grabber {
+    fn drop(&mut self) {
+        self.manager.destroy();
+        let _ = self.queue.roundtrip(&mut self.state);
     }
 }

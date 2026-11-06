@@ -16,6 +16,7 @@ use std::{
 };
 
 mod editor;
+mod longshot;
 mod scene;
 
 /// glibc 2.43 把 `acosf` 的默认符号版本提升到了 2.43；自己实现可避免发布二进制
@@ -181,15 +182,26 @@ fn capture_session(
         let selection = seeds.first().copied().unwrap_or(full);
         (Some(receiver), selection)
     };
-    editor::NativeEditor::run(editor::Session {
+    let physical = (source.width(), source.height());
+    let longshot = editor::NativeEditor::run(editor::Session {
         source,
         direct_edit,
-        save_dir: directory,
+        save_dir: directory.clone(),
         output: Some(selected.name.clone()),
         logical: (selected.width, selected.height),
         selection,
         candidates,
-    })
+    })?;
+    // 编辑器已退出并释放整屏截图；长截图只保留拼接结果。
+    match longshot {
+        Some(selection) => longshot::run(longshot::Request {
+            output: selected,
+            physical,
+            selection,
+            save_dir: directory,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// 离线诊断：输出候选框 JSON 和叠加图，便于在真实截图上评估智能选区。

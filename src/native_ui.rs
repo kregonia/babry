@@ -92,7 +92,8 @@ pub enum Action {
     Save,
     Cancel,
     Copy,
-    More,
+    /// 以当前选区开始滚动长截图。
+    Longshot,
     Grip,
     Width,
     Number,
@@ -382,7 +383,7 @@ const BUTTONS: &[(f32, Action, &str)] = &[
     (414.0, Action::Save, "save"),
     (450.0, Action::Cancel, "cancle"),
     (486.0, Action::Copy, "copy"),
-    (522.0, Action::More, "more"),
+    (522.0, Action::Longshot, "longshot"),
 ];
 fn swatch_box(b: BoxF, index: usize) -> BoxF {
     let (x, y, w, h) = if index < 20 {
@@ -778,6 +779,135 @@ pub fn draw_error(
     Ok(())
 }
 
+/// 长截图控制条的逻辑尺寸（不含阴影）。
+pub const LONGSHOT_PANEL: (f32, f32) = (340.0, 44.0);
+
+/// 边框与截图区域之间留 1 个逻辑像素，分数缩放下也不会被拍进结果。
+pub const LONGSHOT_GAP: i32 = 1;
+pub const LONGSHOT_THICKNESS: i32 = 2;
+const LONGSHOT_SPACING: f32 = 8.0;
+
+/// 截图区域外的四条边框，裁剪到屏幕内；完全在屏幕外的边被省略。
+pub fn longshot_border_strips(region: RectPx, screen: (u32, u32)) -> Vec<RectPx> {
+    let o = LONGSHOT_GAP + LONGSHOT_THICKNESS;
+    let (x, y, w, h) = (
+        region.x,
+        region.y,
+        region.width as i32,
+        region.height as i32,
+    );
+    let strips = [
+        (x - o, y - o, w + 2 * o, LONGSHOT_THICKNESS),
+        (x - o, y + h + LONGSHOT_GAP, w + 2 * o, LONGSHOT_THICKNESS),
+        (
+            x - o,
+            y - LONGSHOT_GAP,
+            LONGSHOT_THICKNESS,
+            h + 2 * LONGSHOT_GAP,
+        ),
+        (
+            x + w + LONGSHOT_GAP,
+            y - LONGSHOT_GAP,
+            LONGSHOT_THICKNESS,
+            h + 2 * LONGSHOT_GAP,
+        ),
+    ];
+    let (sw, sh) = (screen.0 as i32, screen.1 as i32);
+    strips
+        .into_iter()
+        .filter_map(|(x, y, w, h)| {
+            let (left, top) = (x.max(0), y.max(0));
+            let (right, bottom) = ((x + w).min(sw), (y + h).min(sh));
+            (right > left && bottom > top)
+                .then(|| RectPx::new(left, top, (right - left) as u32, (bottom - top) as u32))
+        })
+        .collect()
+}
+
+/// 控制条左上角：优先放在选区下方，其次上方，都放不下时贴在选区内的底部。
+pub fn longshot_panel_origin(region: RectPx, screen: (u32, u32)) -> (f32, f32) {
+    let (pw, ph) = LONGSHOT_PANEL;
+    let (sw, sh) = (screen.0 as f32, screen.1 as f32);
+    let right = (region.x + region.width as i32) as f32;
+    let bottom =
+        (region.y + region.height as i32) as f32 + (LONGSHOT_GAP + LONGSHOT_THICKNESS) as f32;
+    let top = region.y as f32 - (LONGSHOT_GAP + LONGSHOT_THICKNESS) as f32;
+    let y = if bottom + LONGSHOT_SPACING + ph <= sh {
+        bottom + LONGSHOT_SPACING
+    } else if top - LONGSHOT_SPACING - ph >= 0.0 {
+        top - LONGSHOT_SPACING - ph
+    } else {
+        (bottom - LONGSHOT_SPACING - ph).max(0.0)
+    };
+    ((right - pw).clamp(0.0, (sw - pw).max(0.0)), y)
+}
+
+/// 长截图控制条中的按钮：0 取消，1 完成。坐标相对控制条左上角。
+pub fn longshot_buttons() -> [BoxF; 2] {
+    let (w, h) = LONGSHOT_PANEL;
+    [
+        BoxF {
+            x: w - 140.0,
+            y: 6.0,
+            width: 62.0,
+            height: h - 12.0,
+        },
+        BoxF {
+            x: w - 72.0,
+            y: 6.0,
+            width: 66.0,
+            height: h - 12.0,
+        },
+    ]
+}
+
+/// 绘制长截图控制条；`origin` 是控制条在平面中的逻辑位置，`hover` 为悬停按钮。
+pub fn draw_longshot_panel(
+    bytes: &mut [u8],
+    size: (u32, u32),
+    transform: Transform,
+    origin: (f32, f32),
+    status: &str,
+    hover: Option<usize>,
+    fonts: &mut Fonts,
+) -> Result<(), String> {
+    let mut p = painter(bytes, size, transform)?;
+    let b = BoxF {
+        x: origin.0,
+        y: origin.1,
+        width: LONGSHOT_PANEL.0,
+        height: LONGSHOT_PANEL.1,
+    };
+    p.panel(b, 12.0);
+    p.text(fonts, status, b.x + 14.0, b.y + 14.0, 13.0, INK);
+    for (index, (button, label)) in longshot_buttons()
+        .into_iter()
+        .zip(["取消", "完成"])
+        .enumerate()
+    {
+        let button = BoxF {
+            x: b.x + button.x,
+            y: b.y + button.y,
+            ..button
+        };
+        if index == 1 {
+            p.gradient(button, 8.0, &[[115, 85, 174, 255], [67, 107, 176, 255]]);
+        }
+        if hover == Some(index) {
+            p.rect(button, 8.0, [255, 255, 255, 30]);
+        }
+        p.text(
+            fonts,
+            label,
+            button.x + (button.width - 26.0) / 2.0,
+            button.y + 8.0,
+            13.0,
+            WHITE,
+        );
+    }
+    Ok(())
+}
+
 /// 绘制工具栏（含阴影）。`logical` 为输出逻辑尺寸，`s` 为逻辑选区。
 pub fn draw_toolbar(
     bytes: &mut [u8],
@@ -803,7 +933,7 @@ pub fn draw_toolbar(
                 | Action::Save
                 | Action::Cancel
                 | Action::Copy
-                | Action::More
+                | Action::Longshot
                 | Action::Grip
         ) {
             let selected = match action {
@@ -1189,4 +1319,39 @@ fn number(p: &mut Painter<'_>, fonts: &mut Fonts, b: BoxF, value: &str, focused:
         12.0,
         [238, 243, 255, 255],
     );
+}
+
+#[cfg(test)]
+mod longshot_tests {
+    use super::*;
+
+    #[test]
+    fn border_stays_outside_capture_region_and_on_screen() {
+        let region = RectPx::new(100, 50, 400, 300);
+        let strips = longshot_border_strips(region, (1920, 1080));
+        assert_eq!(strips.len(), 4);
+        for strip in &strips {
+            let inside = strip.x < region.x + region.width as i32
+                && strip.x + strip.width as i32 > region.x
+                && strip.y < region.y + region.height as i32
+                && strip.y + strip.height as i32 > region.y;
+            assert!(!inside, "{strip:?} 与截图区域重叠");
+        }
+        // 贴着屏幕左上角的区域：上边和左边落在屏幕外，被省略。
+        assert_eq!(
+            longshot_border_strips(RectPx::new(0, 0, 400, 300), (1920, 1080)).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn panel_prefers_below_then_above_then_inside() {
+        let (pw, ph) = LONGSHOT_PANEL;
+        let below = longshot_panel_origin(RectPx::new(100, 100, 600, 400), (1920, 1080));
+        assert_eq!(below, (700.0 - pw, 511.0));
+        let above = longshot_panel_origin(RectPx::new(100, 600, 600, 470), (1920, 1080));
+        assert_eq!(above, (700.0 - pw, 597.0 - 8.0 - ph));
+        let inside = longshot_panel_origin(RectPx::new(0, 0, 1920, 1080), (1920, 1080));
+        assert!(inside.1 + ph <= 1080.0 && inside.0 + pw <= 1920.0);
+    }
 }
