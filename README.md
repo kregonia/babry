@@ -92,7 +92,7 @@ NixOS 用户可以通过 flake 直接运行：
 nix run github:kregonia/babry
 ```
 
-也可以将仓库添加到系统 flake，在 `nixosSystem` 的模块中安装：
+也可以将仓库添加到系统 flake，并启用 `programs.babry`。模块会安装 Babry，并在图形会话开始时启动用户级 daemon：
 
 ```nix
 {
@@ -104,15 +104,18 @@ nix run github:kregonia/babry
   outputs = { nixpkgs, babry, ... }: {
     nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
-      modules = [{
-        environment.systemPackages = [
-          babry.packages.x86_64-linux.default
-        ];
-      }];
+      modules = [
+        babry.nixosModules.default
+        {
+          programs.babry.enable = true;
+        }
+      ];
     };
   };
 }
 ```
+
+需要覆盖默认软件包时，可设置 `programs.babry.package`。
 
 仓库提供 `nix develop` 开发环境；Babry 需要 Fontconfig、xkbcommon、Wayland 和 systemd 运行库。
 

@@ -51,6 +51,47 @@
         babry = packageFor system;
       });
 
+      nixosModules = {
+        default = { config, lib, pkgs, ... }:
+          let
+            cfg = config.programs.babry;
+          in
+          {
+            options.programs.babry = {
+              enable = lib.mkEnableOption "Babry Wayland screenshot tool";
+
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = packageFor pkgs.system;
+                defaultText = lib.literalExpression "babry.packages.\${pkgs.system}.default";
+                description = "Babry package to install and run.";
+              };
+            };
+
+            config = lib.mkIf cfg.enable {
+              environment.systemPackages = [ cfg.package ];
+
+              systemd.user.services.babry = {
+                description = "Babry Wayland screenshot daemon";
+                wantedBy = [ "graphical-session.target" ];
+                partOf = [ "graphical-session.target" ];
+                after = [ "graphical-session.target" ];
+                unitConfig = {
+                  StartLimitIntervalSec = 60;
+                  StartLimitBurst = 5;
+                };
+                serviceConfig = {
+                  ExecStart = "${cfg.package}/bin/babry --daemon";
+                  Restart = "on-failure";
+                  RestartSec = "5s";
+                };
+              };
+            };
+          };
+
+        babry = self.nixosModules.default;
+      };
+
       apps = forAllSystems (system: {
         default = {
           type = "app";
