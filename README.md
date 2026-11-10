@@ -86,6 +86,39 @@
 
 ### 1. 安装 Babry
 
+NixOS 用户可以通过 flake 直接运行：
+
+```bash
+nix run github:kregonia/babry
+```
+
+也可以将仓库添加到系统 flake，并启用 `programs.babry`。模块会安装 Babry，并在图形会话开始时启动用户级 daemon：
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    babry.url = "github:kregonia/babry";
+  };
+
+  outputs = { nixpkgs, babry, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        babry.nixosModules.default
+        {
+          programs.babry.enable = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+需要覆盖默认软件包时，可设置 `programs.babry.package`。
+
+仓库提供 `nix develop` 开发环境；Babry 需要 Fontconfig、xkbcommon、Wayland 和 systemd 运行库。
+
 Arch Linux 及其衍生发行版用户可以通过 AUR 安装二进制包 [babry-bin](https://aur.archlinux.org/packages/babry-bin)，无需本地编译 Rust：
 
 ```bash
