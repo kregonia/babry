@@ -184,7 +184,7 @@ impl EditorUi {
     pub fn menu_box(&self, screen: (u32, u32), selection: BoxF, menu: Menu) -> BoxF {
         let toolbar = self.toolbar(screen, selection);
         let (anchor_x, anchor_y, width, height) = match menu {
-            Menu::Shapes => (toolbar.x + 70.0, toolbar.y + 8.0, 160.0, 122.0),
+            Menu::Shapes => (toolbar.x + 70.0, toolbar.y + 8.0, 160.0, 194.0),
             Menu::Effects => (toolbar.x + 230.0, toolbar.y + 8.0, 160.0, 86.0),
             Menu::Colors => (toolbar.x + 283.0, toolbar.y + 54.0, 278.0, 174.0),
         };
@@ -225,7 +225,13 @@ impl EditorUi {
                 }
                 _ => {
                     let items: &[Action] = if menu == Menu::Shapes {
-                        &[Action::Shape(2), Action::Shape(14), Action::Shape(13)]
+                        &[
+                            Action::Shape(2),
+                            Action::Shape(14),
+                            Action::Shape(13),
+                            Action::Shape(4),
+                            Action::Shape(5),
+                        ]
                     } else {
                         &[Action::Effect(0), Action::Effect(1)]
                     };
@@ -937,7 +943,7 @@ pub fn draw_toolbar(
                 | Action::Grip
         ) {
             let selected = match action {
-                Action::Tool(2) => matches!(ui.tool, 2 | 13 | 14),
+                Action::Tool(2) => matches!(ui.tool, 2 | 4 | 5 | 13 | 14),
                 Action::Tool(t) => ui.tool == t,
                 _ => false,
             };
@@ -973,6 +979,8 @@ pub fn draw_toolbar(
             Action::Tool(2) => match ui.shape {
                 14 => "shape-circle",
                 13 => "shape-square",
+                4 => "shape-line",
+                5 => "shape-arrow",
                 _ => default_icon,
             },
             Action::Tool(8) if ui.effect == 1 => "blur",
@@ -1245,6 +1253,8 @@ pub fn draw_menu(
                     ("矩形", "shape-rectangle", ui.shape == 2),
                     ("圆形", "shape-circle", ui.shape == 14),
                     ("方形", "shape-square", ui.shape == 13),
+                    ("直线", "shape-line", ui.shape == 4),
+                    ("箭头", "shape-arrow", ui.shape == 5),
                 ]
             } else {
                 &[
@@ -1353,5 +1363,40 @@ mod longshot_tests {
         assert_eq!(above, (700.0 - pw, 597.0 - 8.0 - ph));
         let inside = longshot_panel_origin(RectPx::new(0, 0, 1920, 1080), (1920, 1080));
         assert!(inside.1 + ph <= 1080.0 && inside.0 + pw <= 1920.0);
+    }
+}
+
+#[cfg(test)]
+mod shape_menu_tests {
+    use super::*;
+
+    #[test]
+    fn shape_menu_lists_line_and_arrow_after_basic_shapes() {
+        let screen = (2048, 1152);
+        let selection = BoxF {
+            x: 0.0,
+            y: 0.0,
+            width: 2048.0,
+            height: 1152.0,
+        };
+        let ui = EditorUi {
+            editing: true,
+            menu: Some(Menu::Shapes),
+            ..Default::default()
+        };
+        let menu = ui.menu_box(screen, selection, Menu::Shapes);
+        let pick = |i: usize| {
+            ui.hit(
+                screen,
+                selection,
+                (
+                    f64::from(menu.x) + 75.0,
+                    f64::from(menu.y) + 7.0 + 36.0 * i as f64 + 18.0,
+                ),
+            )
+        };
+        assert_eq!(pick(0), Some(Action::Shape(2)));
+        assert_eq!(pick(3), Some(Action::Shape(4)));
+        assert_eq!(pick(4), Some(Action::Shape(5)));
     }
 }

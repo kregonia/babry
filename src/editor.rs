@@ -67,6 +67,20 @@ use std::{
 const LEFT: u32 = 0x110;
 const RIGHT: u32 = 0x111;
 
+/// 撤销栈中的一步编辑；标注本身保存在 `marks` 中，移动只记录位移。
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edit {
+    Add,
+    Move { index: usize, dx: f32, dy: f32 },
+}
+
+/// 重做栈：撤销“新增”时保留被移除的标注，撤销“移动”只需位移。
+#[derive(Clone, Debug)]
+enum Redo {
+    Add(Mark),
+    Move { index: usize, dx: f32, dy: f32 },
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PointerDrag {
     Select {
@@ -82,6 +96,12 @@ enum PointerDrag {
         edge: u8,
     },
     Mark,
+    /// 无工具时拖动已有标注；`moved` 为累计位移（物理像素）。
+    MoveMark {
+        index: usize,
+        last: (f32, f32),
+        moved: (f32, f32),
+    },
     Toolbar {
         offset: (f64, f64),
     },
@@ -127,7 +147,8 @@ pub struct NativeEditor {
     fonts: Fonts,
     marks: Vec<Mark>,
     pending: Option<Mark>,
-    redo: Vec<Mark>,
+    edits: Vec<Edit>,
+    redo: Vec<Redo>,
     text_editing: bool,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -234,6 +255,7 @@ impl NativeEditor {
             fonts: Fonts::new(),
             marks: Vec::new(),
             pending: None,
+            edits: Vec::new(),
             redo: Vec::new(),
             text_editing: false,
             pointer: None,
@@ -393,7 +415,7 @@ impl NativeEditor {
         };
         let empty = match mark.kind {
             marks::TEXT => mark.text.trim().is_empty(),
-            marks::RECTANGLE | marks::SQUARE | marks::CIRCLE => {
+            marks::RECTANGLE | marks::SQUARE | marks::CIRCLE | marks::LINE | marks::ARROW => {
                 (mark.x2 - mark.x1).abs() < 2.0 && (mark.y2 - mark.y1).abs() < 2.0
             }
             _ => false,
@@ -403,27 +425,79 @@ impl NativeEditor {
             return;
         }
         self.marks.push(mark);
+        self.edits.push(Edit::Add);
         self.redo.clear();
         self.update_next_number();
         self.dirty = true;
     }
 
+    /// 平移一条已提交的标注并重绘新旧范围。
+    fn shift_mark(&mut self, index: usize, dx: f32, dy: f32) {
+        let Some(mark) = self.marks.get_mut(index) else {
+            return;
+        };
+        let before = mark.bounds();
+        mark.translate(dx, dy);
+        let after = mark.bounds();
+        // 马赛克/模糊读取下方标注，移动后其上方的效果也要重新计算。
+        let damage = match (before, after) {
+            (Some(a), Some(b)) => Some(marks::union(Some(a), b)),
+            (a, b) => a.or(b),
+        };
+        let effects: Vec<RectPx> = self.marks[index + 1..]
+            .iter()
+            .filter(|m| matches!(m.kind, marks::MOSAIC | marks::BLUR))
+            .filter_map(Mark::bounds)
+            .filter(|b| damage.and_then(|d| marks::intersect(*b, d)).is_some())
+            .collect();
+        self.damage(damage);
+        for rect in effects {
+            self.damage(Some(rect));
+        }
+    }
+
+    /// 最上层被 `position`（逻辑坐标）命中的可移动标注。
+    fn mark_at(&self, position: (f64, f64)) -> Option<usize> {
+        let (x, y) = self.to_physical(position);
+        let tolerance = 6.0 * self.scale();
+        self.marks
+            .iter()
+            .rposition(|mark| mark.hit(x, y, tolerance))
+    }
+
     fn undo(&mut self) {
         self.commit_pending();
-        if let Some(mark) = self.marks.pop() {
-            self.damage(mark.bounds());
-            self.redo.push(mark);
-            self.update_next_number();
+        match self.edits.pop() {
+            Some(Edit::Add) => {
+                if let Some(mark) = self.marks.pop() {
+                    self.damage(mark.bounds());
+                    self.redo.push(Redo::Add(mark));
+                }
+            }
+            Some(Edit::Move { index, dx, dy }) => {
+                self.shift_mark(index, -dx, -dy);
+                self.redo.push(Redo::Move { index, dx, dy });
+            }
+            None => {}
         }
+        self.update_next_number();
     }
 
     fn redo(&mut self) {
         self.commit_pending();
-        if let Some(mark) = self.redo.pop() {
-            self.damage(mark.bounds());
-            self.marks.push(mark);
-            self.update_next_number();
+        match self.redo.pop() {
+            Some(Redo::Add(mark)) => {
+                self.damage(mark.bounds());
+                self.marks.push(mark);
+                self.edits.push(Edit::Add);
+            }
+            Some(Redo::Move { index, dx, dy }) => {
+                self.shift_mark(index, dx, dy);
+                self.edits.push(Edit::Move { index, dx, dy });
+            }
+            None => {}
         }
+        self.update_next_number();
     }
 
     fn begin_mark(&mut self, position: (f64, f64)) {
@@ -455,6 +529,7 @@ impl NativeEditor {
         let s = self.selection;
         let x = x.clamp(s.x as f32, (s.right() - 1) as f32);
         let y = y.clamp(s.y as f32, (s.bottom() - 1) as f32);
+        let shift = self.modifiers.shift || self.held.1;
         let Some(mark) = self.pending.as_mut() else {
             return;
         };
@@ -463,6 +538,16 @@ impl NativeEditor {
         if mark.kind == marks::NUMBER {
             mark.x1 = x;
             mark.y1 = y;
+        } else if matches!(mark.kind, marks::LINE | marks::ARROW) && shift {
+            // 按住 Shift 时直线和箭头吸附到 45° 的整数倍。
+            let (dx, dy) = (x - mark.x1, y - mark.y1);
+            let angle =
+                (dy.atan2(dx) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
+            let length = dx.hypot(dy);
+            mark.update(
+                mark.x1 + angle.cos() * length,
+                mark.y1 + angle.sin() * length,
+            );
         } else {
             mark.update(x, y);
         }
@@ -698,6 +783,17 @@ impl NativeEditor {
                 self.selection = RectPx::new(l, t, (r - l) as u32, (b - t) as u32);
             }
             PointerDrag::Mark => self.update_mark(position),
+            PointerDrag::MoveMark { index, last, moved } => {
+                let (dx, dy) = (physical.0 - last.0, physical.1 - last.1);
+                if dx != 0.0 || dy != 0.0 {
+                    self.shift_mark(index, dx, dy);
+                    self.pointer_drag = Some(PointerDrag::MoveMark {
+                        index,
+                        last: physical,
+                        moved: (moved.0 + dx, moved.1 + dy),
+                    });
+                }
+            }
             PointerDrag::Toolbar { offset } => {
                 let screen = self.logical;
                 let b = self.ui.toolbar(screen, self.ui_selection());
@@ -752,7 +848,7 @@ impl NativeEditor {
             Action::Tool(tool) => {
                 self.ui.menu = None;
                 self.ui.tool = match tool {
-                    2 if matches!(self.ui.tool, 2 | 13 | 14) => 0,
+                    2 if matches!(self.ui.tool, 2 | 4 | 5 | 13 | 14) => 0,
                     2 => self.ui.shape,
                     tool if self.ui.tool == tool => 0,
                     tool => tool,
@@ -823,7 +919,7 @@ impl NativeEditor {
         if !self.ui.editing {
             return Shape::Crosshair;
         }
-        if let Some(PointerDrag::Move { .. }) = self.pointer_drag {
+        if let Some(PointerDrag::Move { .. } | PointerDrag::MoveMark { .. }) = self.pointer_drag {
             return Shape::Grabbing;
         }
         let selected = self.ui_selection();
@@ -842,6 +938,7 @@ impl NativeEditor {
             3 => Shape::EResize,
             4 => Shape::SResize,
             _ if selected.contains(position) => match self.ui.tool {
+                0 if self.mark_at(position).is_some() => Shape::Grab,
                 0 => Shape::Move,
                 10 => Shape::Text,
                 _ => Shape::Crosshair,
@@ -956,6 +1053,19 @@ impl NativeEditor {
                 origin: self.selection,
                 edge,
             });
+        } else if selected.contains(position)
+            && self.ui.tool == 0
+            && let Some(index) = {
+                self.commit_pending();
+                self.mark_at(position)
+            }
+        {
+            // 无工具时先命中已有标注：拖动标注；空白处仍然移动选区。
+            self.pointer_drag = Some(PointerDrag::MoveMark {
+                index,
+                last: self.to_physical(position),
+                moved: (0.0, 0.0),
+            });
         } else if selected.contains(position) && self.ui.tool == 0 {
             self.commit_pending();
             self.pointer_drag = Some(PointerDrag::Move {
@@ -986,6 +1096,15 @@ impl NativeEditor {
             }
         } else if matches!(drag, Some(PointerDrag::Mark)) {
             self.commit_pending();
+        } else if let Some(PointerDrag::MoveMark { index, moved, .. }) = drag
+            && (moved.0 != 0.0 || moved.1 != 0.0)
+        {
+            self.edits.push(Edit::Move {
+                index,
+                dx: moved.0,
+                dy: moved.1,
+            });
+            self.redo.clear();
         } else if matches!(
             drag,
             Some(PointerDrag::Select { .. } | PointerDrag::Resize { .. })

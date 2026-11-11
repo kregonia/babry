@@ -10,6 +10,8 @@ use tiny_skia::{
 
 pub const PEN: u8 = 1;
 pub const RECTANGLE: u8 = 2;
+pub const LINE: u8 = 4;
+pub const ARROW: u8 = 5;
 pub const HIGHLIGHTER: u8 = 7;
 pub const MOSAIC: u8 = 8;
 pub const BLUR: u8 = 9;
@@ -120,6 +122,17 @@ impl Mark {
                 self.y1 + self.extent.1,
                 self.font_size * 0.25 + 2.0,
             ),
+            LINE | ARROW => (
+                self.x1.min(self.x2),
+                self.y1.min(self.y2),
+                self.x1.max(self.x2),
+                self.y1.max(self.y2),
+                if self.kind == ARROW {
+                    arrow_head(self.width) + 2.0
+                } else {
+                    self.width.max(1) as f32 / 2.0 + 2.0
+                },
+            ),
             _ => {
                 let end = self.shape_end();
                 (
@@ -145,6 +158,73 @@ impl Mark {
             (b - y).max(1) as u32,
         ))
     }
+}
+
+impl Mark {
+    /// 可被重新选中并拖动的标注：图形、线条、文字、序号和画笔笔迹。
+    /// 橡皮擦与马赛克/模糊依赖下方像素，移动后语义不清，不参与选择。
+    pub fn movable(&self) -> bool {
+        !matches!(self.kind, ERASER | MOSAIC | BLUR)
+    }
+
+    /// 整体平移标注，保留内容与样式。
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        self.x1 += dx;
+        self.y1 += dy;
+        self.x2 += dx;
+        self.y2 += dy;
+        for point in &mut self.points {
+            point.0 += dx;
+            point.1 += dy;
+        }
+    }
+
+    /// 物理坐标 `(x, y)` 是否落在标注上；`tolerance` 为额外的命中容差。
+    /// 线条和笔迹按到路径的距离判断，图形、文字和序号按外接范围判断。
+    pub fn hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
+        if !self.movable() {
+            return false;
+        }
+        match self.kind {
+            LINE | ARROW => {
+                let reach = self.width.max(1) as f32 / 2.0 + tolerance;
+                segment_distance((x, y), (self.x1, self.y1), (self.x2, self.y2)) <= reach
+            }
+            k if is_brush(k) => {
+                let reach = self.stroke_width() / 2.0 + tolerance;
+                match self.points.as_slice() {
+                    [] => false,
+                    [p] => (p.0 - x).hypot(p.1 - y) <= reach,
+                    points => points
+                        .windows(2)
+                        .any(|w| segment_distance((x, y), w[0], w[1]) <= reach),
+                }
+            }
+            _ => self.bounds().is_some_and(|b| {
+                let t = tolerance;
+                x >= b.x as f32 - t
+                    && y >= b.y as f32 - t
+                    && x <= b.right() as f32 + t
+                    && y <= b.bottom() as f32 + t
+            }),
+        }
+    }
+}
+
+fn segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = dx * dx + dy * dy;
+    let t = if len <= f32::EPSILON {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len).clamp(0.0, 1.0)
+    };
+    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
+}
+
+/// 箭头头部长度：随线宽增长，细线也保持清晰可见。
+fn arrow_head(width: u32) -> f32 {
+    (width.max(1) as f32 * 4.0).max(14.0)
 }
 
 pub fn is_brush(kind: u8) -> bool {
@@ -245,6 +325,7 @@ pub fn render_layer(
             }
             MOSAIC | BLUR => draw_effect(target, origin, area, marks, index, source, fonts),
             RECTANGLE | SQUARE | CIRCLE => draw_shape(target, mark, transform),
+            LINE | ARROW => draw_line(target, mark, transform),
             NUMBER => draw_number(target, mark, transform, fonts),
             TEXT => {
                 let paint = paint(mark.color);
@@ -302,6 +383,54 @@ fn draw_shape(target: &mut PixmapMut<'_>, mark: &Mark, transform: Transform) {
             ..Stroke::default()
         };
         target.stroke_path(&path, &paint, &stroke, transform, None);
+    }
+}
+
+/// 直线圆头；箭头的线身止于箭头底边，头部为实心三角形。
+fn draw_line(target: &mut PixmapMut<'_>, mark: &Mark, transform: Transform) {
+    let (dx, dy) = (mark.x2 - mark.x1, mark.y2 - mark.y1);
+    let length = dx.hypot(dy);
+    if length < 1.0 {
+        return;
+    }
+    let width = mark.width.max(1) as f32;
+    let paint = paint(mark.color);
+    let (ux, uy) = (dx / length, dy / length);
+    let head = if mark.kind == ARROW {
+        arrow_head(mark.width).min(length)
+    } else {
+        0.0
+    };
+    // 箭头头部较宽，线身缩回一点避免圆头从三角形两侧露出。
+    let shaft = (length - head * 0.8).max(0.0);
+    if shaft > 0.0 {
+        let mut builder = PathBuilder::new();
+        builder.move_to(mark.x1, mark.y1);
+        builder.line_to(mark.x1 + ux * shaft, mark.y1 + uy * shaft);
+        if let Some(path) = builder.finish() {
+            let stroke = Stroke {
+                width,
+                line_cap: if head > 0.0 {
+                    LineCap::Butt
+                } else {
+                    LineCap::Round
+                },
+                ..Stroke::default()
+            };
+            target.stroke_path(&path, &paint, &stroke, transform, None);
+        }
+    }
+    if head > 0.0 {
+        let half = (head * 0.5).max(width * 1.5);
+        let (bx, by) = (mark.x2 - ux * head, mark.y2 - uy * head);
+        let mut builder = PathBuilder::new();
+        builder.move_to(mark.x2, mark.y2);
+        builder.line_to(bx - uy * half, by + ux * half);
+        builder.line_to(bx + uy * half, by - ux * half);
+        builder.close();
+        if let Some(path) = builder.finish() {
+            target.fill_path(&path, &paint, FillRule::Winding, transform, None);
+        }
     }
 }
 
@@ -652,5 +781,46 @@ mod tests {
         assert_eq!(pixmap.pixel(9, 20).unwrap().alpha(), 255);
         assert_eq!(pixmap.pixel(30, 30).unwrap().alpha(), 0);
         assert!(pixmap.pixel(24, 9).unwrap().green() > 0);
+    }
+
+    #[test]
+    fn arrow_draws_shaft_and_filled_head() {
+        let src = source(80, 40);
+        let mut arrow = Mark::new(ARROW, 6.0, 20.0, [255, 0, 0, 255], 3);
+        arrow.update(74.0, 20.0);
+        let pixmap = layer(&[arrow.clone()], &src, (0, 0), (80, 40));
+        assert_eq!(pixmap.pixel(30, 20).unwrap().alpha(), 255, "线身");
+        // 头部比线身宽：距中线 4 像素处仍有颜色，线身同位置没有。
+        assert!(pixmap.pixel(63, 24).unwrap().alpha() > 200, "箭头头部");
+        assert_eq!(pixmap.pixel(30, 24).unwrap().alpha(), 0);
+        let bounds = arrow.bounds().unwrap();
+        assert!(bounds.y <= 20 - 7 && bounds.bottom() >= 20 + 7);
+        let mut line = Mark::new(LINE, 6.0, 20.0, [0, 0, 255, 255], 3);
+        line.update(74.0, 20.0);
+        let pixmap = layer(&[line], &src, (0, 0), (80, 40));
+        assert_eq!(pixmap.pixel(73, 20).unwrap().alpha(), 255);
+        assert_eq!(pixmap.pixel(63, 24).unwrap().alpha(), 0);
+    }
+
+    #[test]
+    fn hit_testing_follows_shape_and_translate_moves_everything() {
+        let mut line = Mark::new(LINE, 0.0, 0.0, [0, 0, 0, 255], 4);
+        line.update(100.0, 100.0);
+        assert!(line.hit(50.0, 52.0, 2.0));
+        assert!(!line.hit(50.0, 70.0, 2.0));
+        let mut pen = Mark::new(PEN, 10.0, 10.0, [0, 0, 0, 255], 4);
+        pen.update(60.0, 10.0);
+        pen.update(60.0, 60.0);
+        assert!(pen.hit(60.0, 35.0, 1.0));
+        assert!(!pen.hit(30.0, 35.0, 1.0));
+        let mut rect = Mark::new(RECTANGLE, 10.0, 10.0, [0, 0, 0, 255], 2);
+        rect.update(40.0, 30.0);
+        assert!(rect.hit(25.0, 20.0, 0.0), "图形内部也可以选中");
+        let mut eraser = Mark::new(ERASER, 0.0, 0.0, [0, 0, 0, 255], 10);
+        eraser.update(10.0, 10.0);
+        assert!(!eraser.hit(5.0, 5.0, 2.0));
+        pen.translate(5.0, -3.0);
+        assert_eq!(pen.points, vec![(15.0, 7.0), (65.0, 7.0), (65.0, 57.0)]);
+        assert_eq!((pen.x1, pen.y1, pen.x2, pen.y2), (15.0, 7.0, 65.0, 57.0));
     }
 }

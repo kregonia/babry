@@ -8,6 +8,7 @@ include!("support/workflow.rs");
 include!("support/kde_ime.rs");
 include!("support/daemon.rs");
 include!("support/longshot.rs");
+include!("support/annotate.rs");
 use babry::{
     compositor::{self, Backend},
     core::RectPx,

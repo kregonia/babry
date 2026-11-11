@@ -117,6 +117,11 @@ pub fn definitions() -> Vec<Icon> {
                 0.0,
             )],
         ),
+        Icon::new("shape-line", &[IconShape::Path("M5 19 19 5", 1.8)]),
+        Icon::new(
+            "shape-arrow",
+            &[IconShape::Path("M5 19 18 6M10 6h8v8", 1.8)],
+        ),
         Icon::new(
             "longshot",
             &[
