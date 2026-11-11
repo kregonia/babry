@@ -1,21 +1,15 @@
-//! 滚动长截图：编辑器退出后，在选区四周画一圈不接收输入的边框，用户照常滚动下方
-//! 窗口；后台线程按区域连续截图，交给 `stitch` 拼接，点“完成”后保存并复制。
-//!
-//! 边框和控制条都放在截图区域之外，不会被拍进结果。
+//! 滚动长截图的取帧与拼接。编辑器保持打开：工具栏和选区边框留在截图区域之外，
+//! 选区内的输入穿透到下方窗口；后台线程按区域连续截图交给 `stitch` 拼接，
+//! 再次点击长截图按钮后拼接结果成为可编辑的长图画布。
 use babry::{
     compositor::{Backend, OutputInfo},
-    config,
     core::RectPx,
     kde,
     screencopy::Grabber,
     shm_image::ShmImage,
-    stitch::{Frame, Push, Stitcher},
+    stitch::{Frame, MAX_HEIGHT, Push, Stitcher},
 };
 use std::{
-    fs::File,
-    io::BufWriter,
-    path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,20 +19,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod overlay;
-
 /// 取帧间隔；约 12 帧每秒足够跟上滚轮，同时限制 CPU。
 const FRAME_INTERVAL: Duration = Duration::from_millis(80);
 /// 等待编辑器表面从屏幕上消失后再取第一帧。
 const SETTLE: Duration = Duration::from_millis(250);
-
-pub struct Request {
-    pub output: OutputInfo,
-    /// 编辑器截图的物理尺寸，用于把选区换算到输出逻辑坐标。
-    pub physical: (u32, u32),
-    pub selection: RectPx,
-    pub save_dir: PathBuf,
-}
 
 /// 后台线程报告给控制条的进度。
 #[derive(Clone, Copy, Debug)]
@@ -163,64 +147,100 @@ fn spawn_worker(
     })
 }
 
-/// 流式写出 RGB PNG；失败时删除不完整的文件。
-fn save_png(path: &Path, width: u32, height: u32, rgb: &[u8]) -> Result<(), String> {
-    let write = || -> Result<(), String> {
-        let file = File::create(path).map_err(|error| format!("无法创建 PNG: {error}"))?;
-        let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|error| format!("写入 PNG 头部失败: {error}"))?;
-        writer
-            .write_image_data(rgb)
-            .map_err(|error| format!("写入 PNG 像素失败: {error}"))?;
-        writer
-            .finish()
-            .map_err(|error| format!("完成 PNG 写入失败: {error}"))
-    };
-    let result = write();
-    if result.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    result
-}
-
-fn copy_to_clipboard(path: &Path) -> Result<(), String> {
-    let file = File::open(path).map_err(|error| error.to_string())?;
-    let status = Command::new("wl-copy")
-        .args(["--type", "image/png"])
-        .stdin(file)
-        .status()
-        .map_err(|error| format!("无法启动 wl-copy: {error}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("wl-copy 失败: {status}"))
-}
-
-pub fn run(request: Request) -> Result<(), String> {
-    let logical = (request.output.width, request.output.height);
-    let region = logical_region(request.selection, request.physical, logical);
-    let source = Source::open(&request.output, region)?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let (sender, receiver): (Sender<Progress>, Receiver<Progress>) = mpsc::channel();
-    let worker = spawn_worker(source, stop.clone(), sender);
-    let finished = overlay::run(&request.output, region, receiver, &worker);
-    stop.store(true, Ordering::Relaxed);
-    let stitcher = worker
-        .join()
-        .map_err(|_| "长截图线程异常退出".to_string())??;
-    if !finished? {
-        return Ok(());
-    }
+/// 拼接结果转为共享内存图像，作为长图画布的底图（之后释放 RGB 缓冲区）。
+pub fn into_image(stitcher: Stitcher) -> Result<ShmImage, String> {
     let (width, height, rgb) = stitcher.finish().ok_or("长截图没有取到任何画面")?;
-    let path = config::output_path(&request.save_dir)?;
-    save_png(&path, width, height, &rgb)?;
-    drop(rgb);
-    eprintln!("已保存长截图: {} ({width}x{height})", path.display());
-    copy_to_clipboard(&path)
+    let mut image = ShmImage::new(width, height, width * 4)?;
+    for (src, dst) in rgb
+        .chunks_exact(3)
+        .zip(image.bytes_mut().chunks_exact_mut(4))
+    {
+        dst.copy_from_slice(&[src[2], src[1], src[0], 255]);
+    }
+    Ok(image)
+}
+
+/// 进行中的长截图：后台线程、停止标志和进度通道。
+pub struct Capture {
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<Result<Stitcher, String>>>,
+    progress: Receiver<Progress>,
+    first: u32,
+    last: Option<Progress>,
+    lost: u32,
+}
+
+impl Capture {
+    /// 选区（截图物理像素）换算到输出逻辑坐标后开始取帧。
+    pub fn start(
+        output: &OutputInfo,
+        selection: RectPx,
+        physical: (u32, u32),
+    ) -> Result<Self, String> {
+        let region = logical_region(selection, physical, (output.width, output.height));
+        let source = Source::open(output, region)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, progress) = mpsc::channel();
+        let worker = spawn_worker(source, stop.clone(), sender);
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+            progress,
+            first: 0,
+            last: None,
+            lost: 0,
+        })
+    }
+
+    /// 取走新进度，返回需要显示的状态文字（无变化时为 `None`）。
+    /// 偶尔一帧对不上很常见（尤其 KDE 截整屏较慢），连续两帧丢失才提示。
+    pub fn poll(&mut self) -> Option<String> {
+        let mut changed = false;
+        while let Ok(progress) = self.progress.try_recv() {
+            match progress.push {
+                Push::Started => self.first = progress.height,
+                Push::Lost => self.lost += 1,
+                Push::Appended(_) => self.lost = 0,
+                _ => {}
+            }
+            self.last = Some(progress);
+            changed = true;
+        }
+        changed.then(|| self.status())
+    }
+
+    pub fn status(&self) -> String {
+        let Some(progress) = self.last else {
+            return "长截图准备中…".into();
+        };
+        match progress.push {
+            Push::Full => format!("已达上限 {MAX_HEIGHT} px"),
+            _ if self.lost >= 2 => "滚动过快，请回滚一点".into(),
+            _ if progress.height <= self.first => "请滚动选区内的页面".into(),
+            _ => format!("已拼接 {} px", progress.height),
+        }
+    }
+
+    /// 取帧线程已经退出（通常是出错）。
+    pub fn failed(&self) -> bool {
+        self.worker.as_ref().is_none_or(|w| w.is_finished())
+    }
+
+    /// 停止取帧并取回拼接器。
+    pub fn finish(mut self) -> Result<Stitcher, String> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.worker
+            .take()
+            .ok_or("长截图线程不存在")?
+            .join()
+            .map_err(|_| "长截图线程异常退出".to_string())?
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

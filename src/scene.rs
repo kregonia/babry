@@ -109,6 +109,12 @@ impl Plane {
         true
     }
 
+    fn destroy(self) {
+        self.viewport.destroy();
+        self.subsurface.destroy();
+        self.surface.destroy();
+    }
+
     fn hide(&mut self) -> bool {
         if !self.shown {
             return false;
@@ -556,6 +562,33 @@ impl Scene {
     }
 
     /// 界面控件对齐的逻辑网格步长。
+    /// 销毁全部子表面，主表面之后改由调用方直接显示（长截图切换到整帧合成）。
+    pub fn destroy(self) -> (CompositorState, WpViewporter) {
+        let planes = self
+            .masks
+            .into_iter()
+            .chain(self.borders)
+            .chain(self.handles)
+            .chain([
+                self.label.plane,
+                self.toolbar.plane,
+                self.menu.plane,
+                self.caret,
+                self.error.plane,
+            ])
+            .chain(
+                self.tiles
+                    .tiles
+                    .into_iter()
+                    .flatten()
+                    .map(|tile| tile.plane),
+            );
+        for plane in planes {
+            plane.destroy();
+        }
+        (self.compositor, self.viewporter)
+    }
+
     pub fn grid(&self) -> f32 {
         self.step as f32
     }

@@ -23,6 +23,13 @@ use std::{
     },
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LongshotRequest {
+    /// 以该选区（图像物理像素）开始。
+    Start(RectPx),
+    Stop,
+}
+
 /// 前端无关的指针形状。`Resize` 的参数与 `selection_edge` 的边号一致。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cursor {
@@ -87,6 +94,10 @@ pub struct Core {
     pub view: (i32, i32),
     /// 长图画布：选区固定为整张图，滚轮滚动视图。
     pub canvas: bool,
+    /// 长图画布在屏幕上的窗口（屏幕物理像素），即开始长截图时的选区。
+    pub window: RectPx,
+    /// 长图画布窗口外显示的原截图。
+    pub backdrop: Option<Arc<ShmImage>>,
     pub selection: RectPx,
     pub candidates: Vec<smart_select::Candidate>,
     pub candidates_pending: Option<Receiver<Vec<smart_select::Candidate>>>,
@@ -107,8 +118,12 @@ pub struct Core {
     pub save_dir: PathBuf,
     pub output_name: Option<String>,
     pub exit: bool,
-    /// 用户点击长截图后记录选区（图像物理像素）。
-    pub longshot: Option<RectPx>,
+    /// 工具栏长截图按钮发出的请求，由前端处理。
+    pub longshot: Option<LongshotRequest>,
+    /// 正在滚动长截图：只显示边框和工具栏，选区内的输入交给下方窗口。
+    pub capturing: bool,
+    /// 长截图期间显示在选区上方的进度文字。
+    pub capture_status: String,
     pub dirty: bool,
     /// 需要重绘的图像区域（标注变化），由前端取走。
     pub damaged: Vec<RectPx>,
@@ -134,6 +149,8 @@ impl Core {
             logical: init.logical,
             view: (0, 0),
             canvas: init.canvas,
+            window: RectPx::new(0, 0, init.physical.0, init.physical.1),
+            backdrop: None,
             selection: init.selection,
             candidates: Vec::new(),
             candidates_pending: init.candidates,
@@ -157,6 +174,8 @@ impl Core {
             output_name: init.output,
             exit: false,
             longshot: None,
+            capturing: false,
+            capture_status: String::new(),
             dirty: true,
             damaged: Vec::new(),
             source: init.source,
@@ -171,6 +190,32 @@ impl Core {
             );
         }
         core
+    }
+
+    /// 长截图结束：拼接结果放进原选区的位置和大小里，作为可滚动的页面继续编辑；
+    /// 选区外仍显示原截图的遮罩，与普通截图编辑页一致。已有标注按选区原点平移。
+    pub fn enter_canvas(&mut self, image: ShmImage) {
+        self.commit_pending();
+        let window = self.selection;
+        for mark in &mut self.marks {
+            mark.translate(-window.x as f32, -window.y as f32);
+        }
+        self.backdrop = Some(std::mem::replace(&mut self.source, Arc::new(image)));
+        self.canvas = true;
+        self.capturing = false;
+        self.ui.longshot = false;
+        self.capture_status.clear();
+        self.selection = RectPx::new(0, 0, self.source.width(), self.source.height());
+        // 页面宽度可能因逻辑坐标取整比原选区少一两个像素，窗口取二者较小值。
+        self.window = RectPx::new(
+            window.x,
+            window.y,
+            window.width.min(self.source.width()),
+            window.height.min(self.source.height()),
+        );
+        self.view = (-self.window.x, -self.window.y);
+        self.ui.editing = true;
+        self.damage(Some(self.selection));
     }
 
     /// 指针进入表面。
@@ -201,6 +246,9 @@ impl Core {
 
     /// 右键：框选阶段退出；编辑时依次提交文字、收起菜单、取消工具。
     pub fn right_press(&mut self) {
+        if self.capturing {
+            return;
+        }
         if !self.ui.editing {
             self.exit = true;
         } else if self.text_editing {
@@ -273,8 +321,7 @@ impl Core {
             self.selection.height,
         );
         if self.canvas {
-            let screen = RectPx::new(0, 0, self.physical.0, self.physical.1);
-            rect = marks::intersect(rect, screen).unwrap_or(screen);
+            rect = self.window;
         }
         native_ui::logical_selection(rect, self.physical, self.logical)
     }
@@ -287,24 +334,35 @@ impl Core {
         self.dirty = true;
     }
 
-    /// 长图画布按逻辑像素滚动视图；返回是否真的移动了。
+    /// 长图画布在窗口内滚动页面；返回是否真的移动了。
     pub fn scroll_view(&mut self, logical_dy: f64) -> bool {
         if !self.canvas {
             return false;
         }
         let scale = f64::from(self.scale());
-        let (image_h, screen_h) = (self.source.height() as i32, self.physical.1 as i32);
-        let next = if image_h <= screen_h {
-            -(screen_h - image_h) / 2
-        } else {
-            (self.view.1 + (logical_dy * scale).round() as i32).clamp(0, image_h - screen_h)
-        };
+        let limit = (self.source.height() as i32 - self.window.height as i32).max(0);
+        let scroll =
+            (self.view.1 + self.window.y + (logical_dy * scale).round() as i32).clamp(0, limit);
+        let next = scroll - self.window.y;
         if next == self.view.1 {
             return false;
         }
         self.view.1 = next;
         self.dirty = true;
         true
+    }
+
+    /// 当前可见的页面范围（图像坐标）。
+    pub fn visible(&self) -> RectPx {
+        if !self.canvas {
+            return self.selection;
+        }
+        RectPx::new(
+            self.window.x + self.view.0,
+            self.window.y + self.view.1,
+            self.window.width,
+            self.window.height,
+        )
     }
 
     pub fn caret_rect(&mut self) -> Option<RectPx> {
@@ -452,7 +510,8 @@ impl Core {
 
     pub fn update_mark(&mut self, position: (f64, f64)) {
         let (x, y) = self.to_physical(position);
-        let s = self.selection;
+        // 长图画布只能画在当前可见的那一段里。
+        let s = self.visible();
         let x = x.clamp(s.x as f32, (s.right() - 1) as f32);
         let y = y.clamp(s.y as f32, (s.bottom() - 1) as f32);
         let shift = self.shift;
@@ -762,10 +821,16 @@ impl Core {
                 self.report(result);
             }
             Action::Cancel => self.exit = true,
+            // 第一次点击开始长截图，再次点击停止；长图画布中不再嵌套长截图。
+            Action::Longshot if self.canvas => {}
             Action::Longshot => {
                 self.ui.menu = None;
-                self.longshot = Some(self.selection);
-                self.exit = true;
+                self.commit_pending();
+                self.longshot = Some(if self.capturing {
+                    LongshotRequest::Stop
+                } else {
+                    LongshotRequest::Start(self.selection)
+                });
             }
             Action::Dismiss | Action::Blank => self.ui.menu = None,
             Action::Grip
@@ -874,7 +939,12 @@ impl Core {
         }
         let screen = self.logical;
         let selected = self.ui_selection();
-        if let Some(action) = self.ui.hit(screen, selected, position) {
+        let hit = self.ui.hit(screen, selected, position);
+        if self.capturing && !matches!(hit, Some(Action::Longshot | Action::Cancel | Action::Grip))
+        {
+            return;
+        }
+        if let Some(action) = hit {
             self.ui.pressed = Some(action);
             match action {
                 Action::Grip => {

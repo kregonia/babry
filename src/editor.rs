@@ -2,20 +2,25 @@
 //!
 //! 内存模型：截图 memfd 是唯一的整屏像素副本，同时用于显示与导出；界面控件和
 //! 标注瓦片只占用各自的小缓冲区，标注历史只保存矢量命令。
-use crate::scene::{RetiredSlot, Scene, SceneInput, TileSlot};
+use crate::{
+    longshot::Capture,
+    scene::{RetiredSlot, Scene, SceneInput, TileSlot},
+};
 use babry::{
     compositor::{self, Backend, BoundOutput},
     core::RectPx,
-    editor_core::{Core, CoreInit, Cursor},
+    editor_core::{Core, CoreInit, Cursor, LongshotRequest},
+    screencopy,
     shm_image::ShmImage,
     smart_select,
+    soft_render::{self, SoftCache},
 };
 use smithay_client_toolkit::reexports::client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{
         wl_buffer::{self, WlBuffer},
-        wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm_pool, wl_surface,
+        wl_callback, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use smithay_client_toolkit::reexports::protocols::wp::{
@@ -47,7 +52,10 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
     subcompositor::SubcompositorState,
 };
 use std::{
@@ -68,6 +76,15 @@ pub struct Session {
     pub selection: RectPx,
     /// 后台线程完成分析后送达；`None` 表示直接编辑全屏。
     pub candidates: Option<Receiver<Vec<smart_select::Candidate>>>,
+    /// 长截图需要输出的逻辑尺寸、位置和缩放。
+    pub output_info: Option<compositor::OutputInfo>,
+}
+
+/// 长图画布的整帧缓冲区：两块屏幕大小的 wl_shm 轮换，每次重绘整帧。
+struct SoftSurface {
+    pool: SlotPool,
+    buffers: Vec<Buffer>,
+    cache: SoftCache,
 }
 
 pub struct NativeEditor {
@@ -83,6 +100,13 @@ pub struct NativeEditor {
         wp_viewporter::WpViewporter,
     )>,
     pub scene: Option<Scene>,
+    soft: Option<SoftSurface>,
+    /// 场景销毁后保留，用于长截图期间新建主表面和设置输入区域。
+    compositor: Option<CompositorState>,
+    viewporter: Option<wp_viewporter::WpViewporter>,
+    shell: LayerShell,
+    output_info: Option<compositor::OutputInfo>,
+    capture: Option<Capture>,
     core: Core,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -132,7 +156,7 @@ fn shape(cursor: Cursor) -> Shape {
 
 impl NativeEditor {
     /// 运行编辑器；返回 `Some(选区)` 表示用户选择对该选区做长截图。
-    pub fn run(session: Session) -> Result<Option<RectPx>, String> {
+    pub fn run(session: Session) -> Result<(), String> {
         let started = Instant::now();
         let connection =
             Connection::connect_to_env().map_err(|error| format!("无法连接 Wayland: {error}"))?;
@@ -196,6 +220,12 @@ impl NativeEditor {
             viewport,
             parts: Some((compositor, subcompositor, viewporter)),
             scene: None,
+            soft: None,
+            compositor: None,
+            viewporter: None,
+            shell,
+            output_info: session.output_info,
+            capture: None,
             core,
             pointer: None,
             keyboard: None,
@@ -221,12 +251,20 @@ impl NativeEditor {
             _output: output,
         };
         while !editor.core.exit {
-            queue
-                .blocking_dispatch(&mut editor)
-                .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
+            if editor.capture.is_some() {
+                // 长截图期间定时醒来，刷新进度文字。
+                let deadline = Instant::now() + Duration::from_millis(100);
+                screencopy::dispatch_until(&mut queue, &mut editor, deadline)
+                    .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
+            } else {
+                queue
+                    .blocking_dispatch(&mut editor)
+                    .map_err(|error| format!("Wayland 事件循环失败: {error}"))?;
+            }
+            editor.poll_longshot(&qh);
             editor.draw(&qh)?;
         }
-        Ok(editor.core.longshot)
+        Ok(())
     }
 }
 
@@ -250,7 +288,16 @@ impl NativeEditor {
             _ => None,
         };
         let caret = self.core.caret_rect();
-        self.sync_ime(caret);
+        // 输入法光标使用屏幕坐标；长图画布需要减去视图偏移。
+        let view = self.core.view;
+        self.sync_ime(caret.map(|c| RectPx::new(c.x - view.0, c.y - view.1, c.width, c.height)));
+        if self.soft.is_some() {
+            let result = self.draw_soft(caret, qh);
+            if let (Some(len), Some(mark)) = (committed_len, self.core.pending.as_mut()) {
+                mark.text.truncate(len);
+            }
+            return result;
+        }
         let Some(scene) = self.scene.as_mut() else {
             return Ok(());
         };
@@ -288,6 +335,192 @@ impl NativeEditor {
             self.frame_pending = true;
             self.frame_requested = Instant::now();
         }
+        Ok(())
+    }
+
+    /// 处理工具栏长截图按钮的开始/停止请求，并刷新进度。
+    fn poll_longshot(&mut self, qh: &QueueHandle<Self>) {
+        match self.core.longshot.take() {
+            Some(LongshotRequest::Start(selection)) => {
+                let result = self.start_capture(selection, qh);
+                self.core.report(result);
+            }
+            Some(LongshotRequest::Stop) => {
+                let result = self.stop_capture();
+                self.core.report(result);
+            }
+            None => {}
+        }
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        if let Some(status) = capture.poll() {
+            self.core.capture_status = status;
+            self.core.dirty = true;
+        }
+        // 取帧线程出错退出：结束长截图并显示错误，编辑器保持原状。
+        if capture.failed() {
+            let result = self.stop_capture();
+            self.core.report(result);
+        }
+    }
+
+    fn start_capture(&mut self, selection: RectPx, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let info = self.output_info.as_ref().ok_or("长截图需要显示器信息")?;
+        let capture = Capture::start(info, selection, self.core.physical)?;
+        // 子表面场景显示的是冻结的截图；换成透明的整帧合成，露出下方实时窗口。
+        if let Some(scene) = self.scene.take() {
+            let (compositor, viewporter) = scene.destroy();
+            self.compositor = Some(compositor);
+            self.viewporter = Some(viewporter);
+        }
+        // 原主表面挂着不透明的截图缓冲区，合成器会据此跳过下方窗口的绘制；
+        // 换一个新的透明主表面，旧表面随之销毁。
+        let (Some(compositor), Some(viewporter)) = (&self.compositor, &self.viewporter) else {
+            return Err("长截图需要重新创建表面".into());
+        };
+        let surface = compositor.create_surface(qh);
+        let viewport = viewporter.get_viewport(&surface, qh, ());
+        let layer = self.shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("babry"),
+            self._output.as_ref().map(|binding| &binding.output),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(-1);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(0, 0);
+        layer.commit();
+        self.viewport.destroy();
+        self.viewport = viewport;
+        self.layer = layer;
+        // 等新表面 configure 后再画。
+        self.configured = false;
+        self.frame_pending = false;
+        let size = self.core.physical;
+        let pool = SlotPool::new(size.0 as usize * size.1 as usize * 8, &self.shm)
+            .map_err(|e| format!("无法创建画布共享内存: {e}"))?;
+        self.soft = Some(SoftSurface {
+            pool,
+            buffers: Vec::new(),
+            cache: SoftCache::default(),
+        });
+        self.core.capturing = true;
+        self.core.ui.longshot = true;
+        self.core.capture_status = capture.status();
+        self.capture = Some(capture);
+        // 不再抢键盘，用户也可以用 PageDown/空格滚动页面。
+        self.layer
+            .set_keyboard_interactivity(KeyboardInteractivity::None);
+        self.core.dirty = true;
+        Ok(())
+    }
+
+    fn stop_capture(&mut self) -> Result<(), String> {
+        let Some(capture) = self.capture.take() else {
+            return Ok(());
+        };
+        let result = capture
+            .finish()
+            .and_then(crate::longshot::into_image)
+            .map(|image| self.core.enter_canvas(image));
+        // 无论成功与否都恢复正常输入；失败时退回原截图的冻结画面。
+        self.core.capturing = false;
+        self.core.ui.longshot = false;
+        self.layer
+            .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        self.layer.wl_surface().set_input_region(None);
+        if let Some(soft) = self.soft.as_mut() {
+            soft.cache.invalidate();
+        }
+        self.core.dirty = true;
+        result
+    }
+
+    /// 长截图期间只有工具栏接收指针，其余区域的滚轮和点击落到下方窗口。
+    fn update_input_region(&mut self) {
+        let (Some(compositor), true) = (self.compositor.as_ref(), self.core.capturing) else {
+            return;
+        };
+        let Ok(region) = smithay_client_toolkit::compositor::Region::new(compositor) else {
+            return;
+        };
+        let b = self
+            .core
+            .ui
+            .toolbar(self.core.logical, self.core.ui_selection());
+        region.add(
+            b.x.floor() as i32,
+            b.y.floor() as i32,
+            b.width.ceil() as i32 + 1,
+            b.height.ceil() as i32 + 1,
+        );
+        self.layer
+            .wl_surface()
+            .set_input_region(Some(region.wl_region()));
+    }
+
+    /// 长图画布：整帧软件合成到空闲缓冲区并提交到主表面。
+    fn draw_soft(&mut self, caret: Option<RectPx>, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let size = self.core.physical;
+        let Some(soft) = self.soft.as_mut() else {
+            return Ok(());
+        };
+        let index = match soft
+            .buffers
+            .iter()
+            .position(|b| b.canvas(&mut soft.pool).is_some())
+        {
+            Some(index) => index,
+            None if soft.buffers.len() < 2 => {
+                let (buffer, _) = soft
+                    .pool
+                    .create_buffer(
+                        size.0 as i32,
+                        size.1 as i32,
+                        size.0 as i32 * 4,
+                        wl_shm::Format::Argb8888,
+                    )
+                    .map_err(|e| format!("无法创建画布缓冲区: {e}"))?;
+                soft.buffers.push(buffer);
+                soft.buffers.len() - 1
+            }
+            // 两块都在合成器手里：等 release 或下一帧回调再画。
+            None => return Ok(()),
+        };
+        let canvas = soft.buffers[index]
+            .canvas(&mut soft.pool)
+            .ok_or("画布缓冲区仍在使用")?;
+        let core = &mut self.core;
+        let pending = core.pending.take();
+        let has_pending = pending.is_some();
+        core.marks.extend(pending);
+        let marks = std::mem::take(&mut core.marks);
+        let result = soft_render::render(canvas, size, core, &marks, caret, &mut soft.cache);
+        core.marks = marks;
+        if has_pending {
+            core.pending = core.marks.pop();
+        }
+        result?;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        self.update_input_region();
+        let Some(soft) = self.soft.as_mut() else {
+            return Ok(());
+        };
+        let surface = self.layer.wl_surface();
+        soft.buffers[index]
+            .attach_to(surface)
+            .map_err(|e| format!("附加画布缓冲区失败: {e:?}"))?;
+        surface.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
+        surface.frame(qh, surface.clone());
+        self.layer.commit();
+        self.frame_pending = true;
+        self.frame_requested = Instant::now();
+        self.core.dirty = false;
         Ok(())
     }
 
@@ -608,6 +841,14 @@ impl LayerShellHandler for NativeEditor {
         _: u32,
     ) {
         if self.configured {
+            return;
+        }
+        if self.soft.is_some() {
+            self.viewport
+                .set_destination(self.core.logical.0 as i32, self.core.logical.1 as i32);
+            self.configured = true;
+            self.core.dirty = true;
+            let _ = connection;
             return;
         }
         let (w, h) = configure.new_size;

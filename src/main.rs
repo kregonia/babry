@@ -182,26 +182,16 @@ fn capture_session(
         let selection = seeds.first().copied().unwrap_or(full);
         (Some(receiver), selection)
     };
-    let physical = (source.width(), source.height());
-    let longshot = editor::NativeEditor::run(editor::Session {
+    editor::NativeEditor::run(editor::Session {
         source,
         direct_edit,
-        save_dir: directory.clone(),
+        save_dir: directory,
         output: Some(selected.name.clone()),
         logical: (selected.width, selected.height),
         selection,
         candidates,
-    })?;
-    // 编辑器已退出并释放整屏截图；长截图只保留拼接结果。
-    match longshot {
-        Some(selection) => longshot::run(longshot::Request {
-            output: selected,
-            physical,
-            selection,
-            save_dir: directory,
-        }),
-        None => Ok(()),
-    }
+        output_info: Some(selected),
+    })
 }
 
 /// 离线诊断：输出候选框 JSON 和叠加图，便于在真实截图上评估智能选区。

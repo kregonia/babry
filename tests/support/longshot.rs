@@ -124,15 +124,14 @@ fn longshot_scrolls_and_stitches_browser_page() {
         .expect("工具栏里应有长截图按钮");
     input.click(button.0 + 10., button.1);
     pause(900);
+    let overlay = screenshot(&output.name, &dir.join("overlay.png"));
     let region = RectPx::new(
         left as i32,
         top as i32,
         (right - left) as u32,
         (bottom - top) as u32,
     );
-    let panel = native_ui::longshot_panel_origin(region, screen);
-    let overlay = screenshot(&output.name, &dir.join("overlay.png"));
-    // 滚轮逐格向下，每格之间给浏览器平滑滚动和取帧留时间。
+    // 滚轮逐格向下，每格之间给浏览器平滑滚动和取帧留时间。工具栏全程可见。
     input.move_to((left + right) / 2., (top + bottom) / 2.);
     for _ in 0..28 {
         input.scroll(1);
@@ -140,11 +139,43 @@ fn longshot_scrolls_and_stitches_browser_page() {
     }
     pause(800);
     screenshot(&output.name, &dir.join("scrolled.png"));
-    let done = native_ui::longshot_buttons()[1];
-    input.click(
-        f64::from(panel.0 + done.x + done.width / 2.),
-        f64::from(panel.1 + done.y + done.height / 2.),
+    // 再次点击同一个按钮停止，拼接结果进入长图画布，工具栏仍在。
+    input.click(button.0 + 10., button.1);
+    pause(800);
+    let canvas = screenshot(&output.name, &dir.join("canvas.png"));
+    // 长图编辑页：原位置原大小的窗口里滚动页面，再画一个矩形。
+    input.move_to((left + right) / 2., (top + bottom) / 2.);
+    for _ in 0..10 {
+        input.scroll(1);
+        pause(40);
+    }
+    pause(300);
+    let paged = screenshot(&output.name, &dir.join("canvas-scrolled.png"));
+    let probe = RectPx::new(
+        ((left + 40.) * scale) as i32,
+        ((top + 40.) * scale) as i32,
+        ((right - left - 80.) * scale) as u32,
+        ((bottom - top - 80.) * scale) as u32,
     );
+    let moved = (probe.y..probe.bottom())
+        .step_by(7)
+        .filter(|&y| {
+            let x = (probe.x + probe.width as i32 * 3 / 4) as u32;
+            canvas.rgba(x, y as u32) != paged.rgba(x, y as u32)
+        })
+        .count();
+    assert!(moved > 20, "滚轮应在窗口内滚动长图：{moved}");
+    // 窗口外仍是原截图的遮罩，不随页面滚动。
+    let outside = (5u32, (top * scale) as u32 + 50);
+    assert_eq!(canvas.rgba(outside.0, outside.1), paged.rgba(outside.0, outside.1));
+    let rect_tool = (0..toolbar.width as u32)
+        .map(|dx| (f64::from(toolbar.x) + f64::from(dx), f64::from(toolbar.y) + 25.))
+        .find(|&p| ui.hit(screen, selection, p) == Some(native_ui::Action::Tool(2)))
+        .expect("矩形工具");
+    input.click(rect_tool.0 + 10., rect_tool.1);
+    let mark_y = (top + 150.).round();
+    input.drag((left + 100., mark_y), (left + 300., mark_y + 120.), 30);
+    input.key(46, "s", true);
     editor.wait();
     drop(browser);
 
@@ -202,6 +233,21 @@ fn longshot_scrolls_and_stitches_browser_page() {
     assert!(
         f64::from(header_end) < 80.0 * scale,
         "吸顶标题栏不应出现在拼接结果中部：最后一行 {header_end}"
+    );
+    // 矩形画在滚动后的位置：导出图里它的上边应在第一屏以下。只看页面左侧的
+    // 白底文字区（色块在 45% 宽度之后），避免把红色色块当成矩形。
+    let span = (60. * scale) as u32..(result.width() as f64 * 0.4) as u32;
+    let red_rows: Vec<u32> = (0..result.height())
+        .filter(|&y| span.clone().step_by(3).any(|x| red(result.rgba(x, y))))
+        .collect();
+    let first = *red_rows.first().expect("导出图应有矩形");
+    let last = *red_rows.last().unwrap();
+    println!("矩形位于第 {first}..{last} 行");
+    // 矩形逻辑高度 120，物理约 150；上边位置 = 窗口内 150 逻辑像素 + 滚动量。
+    assert!((f64::from(last - first) - 120. * scale).abs() < 12., "矩形高度");
+    assert!(
+        f64::from(first) > (150. + 80.) * scale,
+        "矩形应位于滚动后的页面位置：{first}"
     );
     println!("长截图通过: {}", dir.display());
 }

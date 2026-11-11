@@ -123,6 +123,10 @@ pub fn definitions() -> Vec<Icon> {
             &[IconShape::Path("M5 19 18 6M10 6h8v8", 1.8)],
         ),
         Icon::new(
+            "longshot-stop",
+            &[IconShape::Rect(6.5, 6.5, 11.0, 11.0, 2.0, 0.0)],
+        ),
+        Icon::new(
             "longshot",
             &[
                 IconShape::Rect(5.0, 2.8, 14.0, 18.4, 2.5, 1.6),
