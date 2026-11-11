@@ -99,11 +99,21 @@ impl Reply {
     }
 }
 
-/// 一个 Wayland 会话使用一套 socket 和文件锁，支持同一用户的多个图形会话。
+/// 一个图形会话使用一套 socket 和文件锁，支持同一用户的多个会话。
+/// X11 会话按 `DISPLAY` 区分，与同机的 Wayland 会话互不干扰。
 pub fn socket_path() -> Result<PathBuf, String> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("后台模式需要 XDG_RUNTIME_DIR")?;
-    let display = std::env::var_os("WAYLAND_DISPLAY").ok_or("后台模式需要 Wayland 会话")?;
     let mut hash = DefaultHasher::new();
+    if babry::clipboard::x11_session() {
+        "x11".hash(&mut hash);
+        std::env::var_os("DISPLAY")
+            .ok_or("后台模式需要 DISPLAY")?
+            .hash(&mut hash);
+        return Ok(PathBuf::from(runtime)
+            .join(format!("babry-{:x}", hash.finish()))
+            .join("control.sock"));
+    }
+    let display = std::env::var_os("WAYLAND_DISPLAY").ok_or("后台模式需要 Wayland 会话")?;
     display.hash(&mut hash);
     std::env::var_os("NIRI_SOCKET").hash(&mut hash);
     std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").hash(&mut hash);
