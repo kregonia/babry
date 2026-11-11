@@ -1,7 +1,9 @@
 pub mod cli;
+pub mod clipboard;
 pub mod compositor;
 pub mod config;
 pub mod core;
+pub mod editor_core;
 pub mod export;
 pub mod font;
 pub mod kde;

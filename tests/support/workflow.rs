@@ -127,9 +127,18 @@ fn selection_tools_clipboard_pin_and_shortcuts() {
     assert!(count > 100, "pin did not display annotated pixels");
     assert!(lost < 5, "pin drifted after pointer stopped");
     input.drag((px + 27., py + 22.), (px + 57., py + 42.), 20);
-    input.move_to(center.0 + 25., center.1 + 20.);
+    // 右键打开贴图菜单，再点“关闭贴图”。
+    let at = (center.0 + 25., center.1 + 20.);
+    input.move_to(at.0, at.1);
     input.button(0x111, true);
     input.button(0x111, false);
+    pause(400);
+    let close = native_ui::context_item_box(2);
+    input.move_to(at.0 + 20., at.1 + 10.);
+    input.click(
+        at.0 + f64::from(close.x + close.width / 2.),
+        at.1 + f64::from(close.y + close.height / 2.),
+    );
     pin.wait();
     // 默认无工具状态下 Esc 可直接结束下一次截图。
     let mut again = Editor::start(&dir, true);
