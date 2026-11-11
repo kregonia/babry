@@ -785,6 +785,77 @@ pub fn draw_error(
     Ok(())
 }
 
+/// 右键菜单：每项高度、宽度和内边距（逻辑像素）。
+pub const CONTEXT_ITEM: f32 = 32.0;
+pub const CONTEXT_WIDTH: f32 = 156.0;
+const CONTEXT_PADDING: f32 = 6.0;
+
+/// 右键菜单面板尺寸（不含阴影）。
+pub fn context_menu_size(items: usize) -> (f32, f32) {
+    (
+        CONTEXT_WIDTH,
+        CONTEXT_PADDING * 2.0 + CONTEXT_ITEM * items as f32,
+    )
+}
+
+/// 菜单项范围，坐标相对面板左上角。
+pub fn context_item_box(index: usize) -> BoxF {
+    BoxF {
+        x: CONTEXT_PADDING,
+        y: CONTEXT_PADDING + CONTEXT_ITEM * index as f32,
+        width: CONTEXT_WIDTH - CONTEXT_PADDING * 2.0,
+        height: CONTEXT_ITEM,
+    }
+}
+
+/// 面板内的点 `p` 命中的菜单项。
+pub fn context_hit(items: usize, p: (f64, f64)) -> Option<usize> {
+    (0..items).find(|&i| context_item_box(i).contains(p))
+}
+
+/// 绘制右键菜单；`origin` 为面板在平面中的逻辑位置，`danger` 项用红色文字。
+#[allow(clippy::too_many_arguments)]
+pub fn draw_context_menu(
+    bytes: &mut [u8],
+    size: (u32, u32),
+    transform: Transform,
+    origin: (f32, f32),
+    items: &[&str],
+    hover: Option<usize>,
+    danger: Option<usize>,
+    fonts: &mut Fonts,
+) -> Result<(), String> {
+    let mut p = painter(bytes, size, transform)?;
+    let (w, h) = context_menu_size(items.len());
+    p.panel(
+        BoxF {
+            x: origin.0,
+            y: origin.1,
+            width: w,
+            height: h,
+        },
+        10.0,
+    );
+    for (i, label) in items.iter().enumerate() {
+        let b = context_item_box(i);
+        let b = BoxF {
+            x: b.x + origin.0,
+            y: b.y + origin.1,
+            ..b
+        };
+        if hover == Some(i) {
+            p.rect(b, 6.0, [255, 255, 255, 26]);
+        }
+        let color = if danger == Some(i) {
+            [255, 153, 153, 255]
+        } else {
+            [228, 236, 249, 255]
+        };
+        p.text(fonts, label, b.x + 12.0, b.y + 9.0, 13.0, color);
+    }
+    Ok(())
+}
+
 /// 长截图控制条的逻辑尺寸（不含阴影）。
 pub const LONGSHOT_PANEL: (f32, f32) = (340.0, 44.0);
 

@@ -3,6 +3,8 @@
 //! 缩放和拉伸只改变 wp_viewport 目标尺寸，不在 CPU 上重采样，也不保留第二份图像。
 use crate::{
     compositor::{self, Backend},
+    font::Fonts,
+    native_ui::{self, SHADOW_MARGIN},
     shm_image::ShmImage,
 };
 use smithay_client_toolkit::reexports::client::{
@@ -38,9 +40,29 @@ use smithay_client_toolkit::{
             LayerSurfaceConfigure,
         },
     },
-    shm::{Shm, ShmHandler},
+    shm::{
+        Shm, ShmHandler,
+        slot::{Buffer, SlotPool},
+    },
 };
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+/// 右键菜单项；“关闭贴图”只移除悬浮窗口，不删除磁盘上的图片。
+const MENU_ITEMS: [&str; 3] = ["复制图片", "另存为…", "关闭贴图"];
+
+struct ContextMenu {
+    layer: LayerSurface,
+    viewport: wp_viewport::WpViewport,
+    pool: SlotPool,
+    buffer: Option<Buffer>,
+    /// 表面逻辑尺寸（含阴影留白）。
+    size: (u32, u32),
+    hover: Option<usize>,
+    configured: bool,
+}
 
 const LEFT: u32 = 0x110;
 const RIGHT: u32 = 0x111;
@@ -82,6 +104,7 @@ pub fn run_surface(path: &Path, output: Option<String>) -> Result<(), String> {
         .bind(&qh, 1..=1, ())
         .map_err(|e| format!("合成器缺少 wp_viewporter: {e}"))?;
     let cursor_manager = CursorShapeManager::bind(&globals, &qh).ok();
+    let path = path.to_path_buf();
 
     // 按物理像素 1:1 显示，超出屏幕时等比缩小。
     let natural = (
@@ -157,6 +180,12 @@ pub fn run_surface(path: &Path, output: Option<String>) -> Result<(), String> {
         cursor_shape: None,
         configured: false,
         exit: false,
+        compositor,
+        shell,
+        scale: selected.scale.max(1.0),
+        path,
+        menu: None,
+        fonts: Fonts::new(),
     };
     while !pin.exit {
         queue
@@ -194,6 +223,88 @@ struct Pin {
     cursor_shape: Option<Shape>,
     configured: bool,
     exit: bool,
+    compositor: CompositorState,
+    shell: LayerShell,
+    scale: f32,
+    path: PathBuf,
+    menu: Option<ContextMenu>,
+    fonts: Fonts,
+}
+
+fn copy_image(path: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("无法读取贴图: {e}"))?;
+    let status = Command::new("wl-copy")
+        .args(["--type", "image/png"])
+        .stdin(file)
+        .status()
+        .map_err(|e| format!("无法启动 wl-copy: {e}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("wl-copy 失败: {status}"))
+}
+
+/// 弹出系统保存对话框（zenity 或 kdialog）后复制图片；取消时返回 `None`。
+fn save_as(path: &Path) -> Result<Option<PathBuf>, String> {
+    let default = path.to_string_lossy().into_owned();
+    let dialogs: [(&str, Vec<String>); 2] = [
+        (
+            "zenity",
+            vec![
+                "--file-selection".into(),
+                "--save".into(),
+                "--confirm-overwrite".into(),
+                "--title=另存为".into(),
+                format!("--filename={default}"),
+            ],
+        ),
+        (
+            "kdialog",
+            vec![
+                "--getsavefilename".into(),
+                default.clone(),
+                "image/png".into(),
+            ],
+        ),
+    ];
+    for (program, args) in dialogs {
+        let output = match Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        // 两种对话框取消时都以非零状态退出。
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let chosen = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if chosen.is_empty() {
+            return Ok(None);
+        }
+        let mut target = PathBuf::from(chosen);
+        if target.extension().is_none() {
+            target.set_extension("png");
+        }
+        if target != path {
+            std::fs::copy(path, &target).map_err(|e| format!("另存为失败: {e}"))?;
+        }
+        return Ok(Some(target));
+    }
+    Err("没有找到保存对话框，请安装 zenity 或 kdialog".into())
+}
+
+fn notify(message: &str) {
+    eprintln!("babry: {message}");
+    let _ = Command::new("notify-send")
+        .args(["Babry", message])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn edges_at(position: (f64, f64), width: u32, height: u32) -> (bool, bool, bool, bool) {
@@ -223,6 +334,122 @@ fn cursor_for(edges: (bool, bool, bool, bool)) -> Shape {
 }
 
 impl Pin {
+    /// 在贴图坐标 `at` 处打开右键菜单，超出屏幕时向内收。
+    fn open_menu(&mut self, at: (f64, f64), qh: &QueueHandle<Self>) {
+        self.menu = None;
+        let (w, h) = native_ui::context_menu_size(MENU_ITEMS.len());
+        let size = (
+            (w + SHADOW_MARGIN * 2.0) as u32,
+            (h + SHADOW_MARGIN * 2.0) as u32,
+        );
+        let x = (f64::from(self.x) + at.0 - f64::from(SHADOW_MARGIN)).round() as i32;
+        let y = (f64::from(self.y) + at.1 - f64::from(SHADOW_MARGIN)).round() as i32;
+        let x = x.clamp(0, self.screen.0.saturating_sub(size.0) as i32);
+        let y = y.clamp(0, self.screen.1.saturating_sub(size.1) as i32);
+        let surface = self.compositor.create_surface(qh);
+        let viewport = self._viewporter.get_viewport(&surface, qh, ());
+        viewport.set_destination(size.0 as i32, size.1 as i32);
+        let layer = self.shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("babry-pin-menu"),
+            Some(&self._output.output),
+        );
+        // 与贴图相同的排他区设置，边距才在同一坐标系中（避开顶栏等面板）。
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_size(size.0, size.1);
+        layer.set_margin(y, 0, 0, x);
+        layer.commit();
+        let Ok(pool) = SlotPool::new(64 * 1024, &self.shm) else {
+            return;
+        };
+        self.menu = Some(ContextMenu {
+            layer,
+            viewport,
+            pool,
+            buffer: None,
+            size,
+            hover: None,
+            configured: false,
+        });
+    }
+
+    fn draw_menu(&mut self) {
+        let scale = self.scale;
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if !menu.configured {
+            return;
+        }
+        let physical = (
+            (menu.size.0 as f32 * scale).ceil() as u32,
+            (menu.size.1 as f32 * scale).ceil() as u32,
+        );
+        let Ok((buffer, canvas)) = menu.pool.create_buffer(
+            physical.0 as i32,
+            physical.1 as i32,
+            physical.0 as i32 * 4,
+            wl_shm::Format::Argb8888,
+        ) else {
+            return;
+        };
+        canvas.fill(0);
+        let drawn = native_ui::draw_context_menu(
+            canvas,
+            physical,
+            tiny_skia::Transform::from_scale(
+                physical.0 as f32 / menu.size.0 as f32,
+                physical.1 as f32 / menu.size.1 as f32,
+            ),
+            (SHADOW_MARGIN, SHADOW_MARGIN),
+            &MENU_ITEMS,
+            menu.hover,
+            Some(MENU_ITEMS.len() - 1),
+            &mut self.fonts,
+        );
+        if drawn.is_err() {
+            return;
+        }
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+        }
+        let surface = menu.layer.wl_surface();
+        if buffer.attach_to(surface).is_err() {
+            return;
+        }
+        surface.damage_buffer(0, 0, physical.0 as i32, physical.1 as i32);
+        menu.viewport
+            .set_destination(menu.size.0 as i32, menu.size.1 as i32);
+        surface.commit();
+        // 旧缓冲区在新内容提交后释放。
+        menu.buffer = Some(buffer);
+    }
+
+    fn menu_action(&mut self, index: usize) {
+        self.menu = None;
+        let path = self.path.clone();
+        match index {
+            0 => {
+                std::thread::spawn(move || {
+                    if let Err(error) = copy_image(&path) {
+                        notify(&error);
+                    }
+                });
+            }
+            1 => {
+                std::thread::spawn(move || match save_as(&path) {
+                    Ok(Some(target)) => eprintln!("已另存为: {}", target.display()),
+                    Ok(None) => {}
+                    Err(error) => notify(&error),
+                });
+            }
+            _ => self.exit = true,
+        }
+    }
+
     fn apply_geometry(&mut self, x: i32, y: i32, width: u32, height: u32) {
         let width = width.clamp(1, self.screen.0.max(1));
         let height = height.clamp(1, self.screen.1.max(1));
@@ -430,7 +657,8 @@ impl KeyboardHandler for Pin {
         _: u32,
         event: KeyEvent,
     ) {
-        if event.keysym == Keysym::Escape {
+        // Esc 先收起菜单，没有菜单时关闭贴图。
+        if event.keysym == Keysym::Escape && self.menu.take().is_none() {
             self.exit = true;
         }
     }
@@ -469,13 +697,61 @@ impl PointerHandler for Pin {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         // 同一帧内只应用最后一次移动；松开前先应用它，避免丢失最后一段位移。
         let mut last_motion = None;
         for event in events {
+            if let Some(menu) = self.menu.as_mut()
+                && event.surface == *menu.layer.wl_surface()
+            {
+                let hit = native_ui::context_hit(
+                    MENU_ITEMS.len(),
+                    (
+                        event.position.0 - f64::from(SHADOW_MARGIN),
+                        event.position.1 - f64::from(SHADOW_MARGIN),
+                    ),
+                );
+                if std::env::var_os("BABRY_TRACE").is_some() {
+                    eprintln!(
+                        "babry: 贴图菜单 {:?} {:?} -> {hit:?}",
+                        event.kind, event.position
+                    );
+                }
+                match event.kind {
+                    PointerEventKind::Enter { serial } => {
+                        if let Some(device) = &self.cursor_device {
+                            device.set_shape(serial, Shape::Default);
+                        }
+                        self.cursor_shape = None;
+                    }
+                    // 指针移出菜单即关闭，避免悬浮菜单无法收起。
+                    PointerEventKind::Leave { .. } => {
+                        self.menu = None;
+                        continue;
+                    }
+                    PointerEventKind::Press { button: LEFT, .. } => {
+                        if let Some(index) = hit {
+                            self.menu_action(index);
+                        }
+                        continue;
+                    }
+                    PointerEventKind::Press { button: RIGHT, .. } => {
+                        self.menu = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(menu) = self.menu.as_mut()
+                    && menu.hover != hit
+                {
+                    menu.hover = hit;
+                    self.draw_menu();
+                }
+                continue;
+            }
             if event.surface != *self.layer.wl_surface() {
                 continue;
             }
@@ -485,6 +761,7 @@ impl PointerHandler for Pin {
                     self.cursor_shape = None;
                 }
                 PointerEventKind::Press { button: LEFT, .. } => {
+                    self.menu = None;
                     self.drag = Some(Drag {
                         grab: event.position,
                         geometry: (self.x, self.y, self.width, self.height),
@@ -497,7 +774,11 @@ impl PointerHandler for Pin {
                     }
                     self.drag = None;
                 }
-                PointerEventKind::Press { button: RIGHT, .. } => self.exit = true,
+                // 右键打开菜单；关闭贴图改为菜单项，避免误触。
+                PointerEventKind::Press { button: RIGHT, .. } => {
+                    self.drag = None;
+                    self.open_menu(event.position, qh);
+                }
                 PointerEventKind::Motion { .. } => last_motion = Some(event.position),
                 PointerEventKind::Axis { vertical, .. } => {
                     let steps = if vertical.value120 != 0 {
@@ -522,17 +803,28 @@ impl PointerHandler for Pin {
 }
 
 impl LayerShellHandler for Pin {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.menu.as_ref().is_some_and(|menu| menu.layer == *layer) {
+            self.menu = None;
+        } else {
+            self.exit = true;
+        }
     }
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         _: LayerSurfaceConfigure,
         _: u32,
     ) {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.layer == *layer
+        {
+            menu.configured = true;
+            self.draw_menu();
+            return;
+        }
         if !self.configured {
             // 贴图内容只提交一次；后续拉伸由视口完成。
             let surface = self.layer.wl_surface();

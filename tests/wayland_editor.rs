@@ -9,6 +9,7 @@ include!("support/kde_ime.rs");
 include!("support/daemon.rs");
 include!("support/longshot.rs");
 include!("support/annotate.rs");
+include!("support/pin_menu.rs");
 use babry::{
     compositor::{self, Backend},
     core::RectPx,
