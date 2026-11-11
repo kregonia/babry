@@ -24,6 +24,8 @@ pub enum Command {
         command: Box<Command>,
         directory: PathBuf,
     },
+    /// 内部命令：X11 剪贴板服务进程。
+    X11Clipboard(PathBuf),
 }
 
 impl Command {
@@ -131,6 +133,12 @@ where
                     directory: directory.into(),
                 },
             )
+        }
+        "--x11-clipboard" => {
+            let path = args
+                .next()
+                .ok_or_else(|| "--x11-clipboard 需要图片路径".to_string())?;
+            ensure_no_extra(args, Command::X11Clipboard(PathBuf::from(path)))
         }
         "--daemon" => ensure_no_extra(args, Command::Daemon),
         "--daemon-status" => ensure_no_extra(args, Command::DaemonStatus),

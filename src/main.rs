@@ -18,6 +18,8 @@ use std::{
 mod editor;
 mod longshot;
 mod scene;
+mod x11_editor;
+mod x11_pin;
 
 /// glibc 2.43 把 `acosf` 的默认符号版本提升到了 2.43；自己实现可避免发布二进制
 /// 只能运行在最新发行版。用 atan2 而不是 `f64::acos`，防止 LTO 把它折回 `acosf`。
@@ -83,6 +85,7 @@ fn dispatch(command: cli::Command) -> Result<(), String> {
             dispatch_wrapped(*command, Some(directory))
         }
         cli::Command::DebugSelection { source, directory } => debug_selection(&source, &directory),
+        cli::Command::X11Clipboard(path) => babry::x11::serve_clipboard(&path),
     }
 }
 
@@ -139,10 +142,15 @@ fn capture_session(
     let trace = std::env::var_os("BABRY_TRACE").is_some();
     let outputs = compositor::outputs()?;
     let selected = compositor::select_output(&outputs, output.as_deref())?;
-    let source = match screencopy::capture(Some(&selected.name)) {
+    let x11 = babry::clipboard::x11_session();
+    let source = match if x11 {
+        x11_capture(&selected)
+    } else {
+        screencopy::capture(Some(&selected.name))
+    } {
         Ok(image) => image,
         // KDE 只提供 ScreenShot2；像素经 pipe 直接读入 memfd。
-        Err(error) if compositor::Backend::detect()? == compositor::Backend::Kde => {
+        Err(error) if !x11 && compositor::Backend::detect()? == compositor::Backend::Kde => {
             kde::capture(&selected.name).map_err(|_| error)?
         }
         Err(error) => return Err(error),
@@ -161,7 +169,12 @@ fn capture_session(
     let (candidates, selection) = if direct_edit {
         (None, full)
     } else {
-        let seeds = compositor::window_regions(&selected, (source.width(), source.height()));
+        // X11 下没有合成器窗口信息，只用 CV 分析。
+        let seeds = if x11 {
+            Vec::new()
+        } else {
+            compositor::window_regions(&selected, (source.width(), source.height()))
+        };
         // 智能选区分析与 Wayland 初始化并行；首帧先显示合成器给出的焦点窗口。
         let (sender, receiver) = std::sync::mpsc::channel();
         let image = source.clone();
@@ -182,6 +195,16 @@ fn capture_session(
         let selection = seeds.first().copied().unwrap_or(full);
         (Some(receiver), selection)
     };
+    if x11 {
+        return x11_editor::run(x11_editor::Session {
+            source,
+            output: selected,
+            selection,
+            direct_edit,
+            save_dir: directory,
+            candidates,
+        });
+    }
     editor::NativeEditor::run(editor::Session {
         source,
         direct_edit,
@@ -303,7 +326,22 @@ fn list_outputs() -> Result<(), String> {
 }
 
 fn native_pin(path: &Path, output: Option<String>) -> Result<(), String> {
+    if babry::clipboard::x11_session() {
+        return x11_pin::run(path, output);
+    }
     native_pin::run_surface(path, output)
+}
+
+/// X11：截取所选显示器在根窗口中的范围。
+fn x11_capture(output: &compositor::OutputInfo) -> Result<babry::shm_image::ShmImage, String> {
+    use x11rb::connection::Connection;
+    let (conn, screen) = babry::x11::connect()?;
+    let root = conn.setup().roots[screen].root;
+    babry::x11::capture(
+        &conn,
+        root,
+        babry::core::RectPx::new(output.x, output.y, output.width, output.height),
+    )
 }
 
 fn daemon_status() -> Result<(), String> {

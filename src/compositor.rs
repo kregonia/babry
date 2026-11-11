@@ -194,6 +194,9 @@ pub fn bind_output(connection: &Connection, name: &str) -> Result<BoundOutput, S
 }
 
 pub fn outputs() -> Result<Vec<OutputInfo>, String> {
+    if crate::clipboard::x11_session() {
+        return crate::x11::outputs();
+    }
     let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
     let (globals, mut queue) = registry_queue_init::<Probe>(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();

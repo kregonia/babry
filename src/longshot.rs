@@ -52,11 +52,35 @@ pub fn logical_region(selection: RectPx, physical: (u32, u32), logical: (u32, u3
 /// 取帧来源：wlroots screencopy 直接截区域；KDE 截整屏再裁剪。
 enum Source {
     Wlr(Box<Grabber>),
-    Kde { name: String, crop: RectPx },
+    Kde {
+        name: String,
+        crop: RectPx,
+    },
+    /// X11 没有合成器缓冲区可截，直接读根窗口的对应区域（编辑器窗口此时已隐藏）。
+    X11 {
+        conn: Box<x11rb::rust_connection::RustConnection>,
+        root: u32,
+        rect: RectPx,
+    },
 }
 
 impl Source {
     fn open(output: &OutputInfo, region: RectPx) -> Result<Self, String> {
+        if babry::clipboard::x11_session() {
+            let (conn, screen) = babry::x11::connect()?;
+            let root = x11rb::connection::Connection::setup(&conn).roots[screen].root;
+            let rect = RectPx::new(
+                output.x + region.x,
+                output.y + region.y,
+                region.width,
+                region.height,
+            );
+            return Ok(Self::X11 {
+                conn: Box::new(conn),
+                root,
+                rect,
+            });
+        }
         let area = (
             region.x,
             region.y,
@@ -91,6 +115,11 @@ impl Source {
                 Ok(to_frame(&image, full))
             }
             Self::Kde { name, crop } => Ok(to_frame(&kde::capture(name)?, *crop)),
+            Self::X11 { conn, root, rect } => {
+                let image = babry::x11::capture(conn, *root, *rect)?;
+                let full = RectPx::new(0, 0, image.width(), image.height());
+                Ok(to_frame(&image, full))
+            }
         }
     }
 }

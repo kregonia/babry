@@ -51,7 +51,7 @@ use std::{
 };
 
 /// 右键菜单项；“关闭贴图”只移除悬浮窗口，不删除磁盘上的图片。
-const MENU_ITEMS: [&str; 3] = ["复制图片", "另存为…", "关闭贴图"];
+pub const MENU_ITEMS: [&str; 3] = ["复制图片", "另存为…", "关闭贴图"];
 
 struct ContextMenu {
     layer: LayerSurface,
@@ -232,20 +232,11 @@ struct Pin {
 }
 
 fn copy_image(path: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("无法读取贴图: {e}"))?;
-    let status = Command::new("wl-copy")
-        .args(["--type", "image/png"])
-        .stdin(file)
-        .status()
-        .map_err(|e| format!("无法启动 wl-copy: {e}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("wl-copy 失败: {status}"))
+    crate::clipboard::copy_png(path)
 }
 
 /// 弹出系统保存对话框（zenity 或 kdialog）后复制图片；取消时返回 `None`。
-fn save_as(path: &Path) -> Result<Option<PathBuf>, String> {
+pub fn save_as(path: &Path) -> Result<Option<PathBuf>, String> {
     let default = path.to_string_lossy().into_owned();
     let dialogs: [(&str, Vec<String>); 2] = [
         (
@@ -297,7 +288,7 @@ fn save_as(path: &Path) -> Result<Option<PathBuf>, String> {
     Err("没有找到保存对话框，请安装 zenity 或 kdialog".into())
 }
 
-fn notify(message: &str) {
+pub fn notify(message: &str) {
     eprintln!("babry: {message}");
     let _ = Command::new("notify-send")
         .args(["Babry", message])
