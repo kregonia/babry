@@ -41,6 +41,14 @@ extern "C" fn acosf(x: f32) -> f32 {
     angle as f32
 }
 
+/// 同上：glibc 2.43 也提升了 `atan2f` 的默认符号版本。用 `f64::atan2`（glibc 2.2.5 的
+/// `atan2`）计算后再取单精度。
+#[cfg(target_env = "gnu")]
+#[unsafe(no_mangle)]
+extern "C" fn atan2f(y: f32, x: f32) -> f32 {
+    f64::from(y).atan2(f64::from(x)) as f32
+}
+
 #[path = "daemon.rs"]
 mod daemon;
 
@@ -442,6 +450,10 @@ mod tests {
             );
         }
         assert!(super::acosf(1.5).is_nan());
+        for (y, x) in [(1.0_f32, 1.0_f32), (-2.0, 0.5), (0.0, -1.0), (3.0, 0.0)] {
+            let reference = f64::from(y).atan2(f64::from(x)) as f32;
+            assert!((super::atan2f(y, x) - reference).abs() < 1e-6);
+        }
         assert!(super::acosf(-1.5).is_nan());
     }
 }
