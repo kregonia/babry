@@ -73,6 +73,11 @@
 
               systemd.user.services.babry = {
                 description = "Babry Wayland screenshot daemon";
+                path = with pkgs; [
+                  fontconfig
+                  libnotify
+                  wl-clipboard
+                ];
                 wantedBy = [ "graphical-session.target" ];
                 partOf = [ "graphical-session.target" ];
                 after = [ "graphical-session.target" ];
