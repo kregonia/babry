@@ -20,6 +20,9 @@ pub const NUMBER: u8 = 11;
 pub const ERASER: u8 = 12;
 pub const SQUARE: u8 = 13;
 pub const CIRCLE: u8 = 14;
+/// 仅用于显示的选中框（不会进入标注历史或导出）：`x1..y2` 为未旋转的框，
+/// 按 `angle` 绕框中心旋转，带四角缩放点和顶部旋转手柄。
+pub const FRAME: u8 = 15;
 
 /// 一条标注。坐标与尺寸全部使用截图物理像素。
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +42,9 @@ pub struct Mark {
     /// 文字排版后的实际宽高，由编辑器用同一套字体测量后写入。
     pub extent: (f32, f32),
     pub strength: u32,
+    /// 绕 `center()` 的旋转角（弧度）。只有矩形、方形、圆形、文字和序号使用；
+    /// 线条和笔迹旋转时直接改写坐标，角度保持为 0。
+    pub angle: f32,
 }
 
 impl Mark {
@@ -62,6 +68,7 @@ impl Mark {
             text_width: f32::INFINITY,
             extent: (0.0, 0.0),
             strength: 8,
+            angle: 0.0,
         }
     }
 
@@ -98,8 +105,39 @@ impl Mark {
         }
     }
 
-    /// 标注可能改变的物理像素范围（未裁剪到截图）。
+    /// 标注可能改变的物理像素范围（未裁剪到截图）；旋转后取四角的外接矩形。
     pub fn bounds(&self) -> Option<RectPx> {
+        let raw = self.raw_bounds()?;
+        if self.angle == 0.0 {
+            return Some(raw);
+        }
+        let (cx, cy) = self.center();
+        let (sin, cos) = self.angle.sin_cos();
+        let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (x, y) in [
+            (raw.x, raw.y),
+            (raw.right(), raw.y),
+            (raw.x, raw.bottom()),
+            (raw.right(), raw.bottom()),
+        ] {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            let (x, y) = (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
+            l = l.min(x);
+            t = t.min(y);
+            r = r.max(x);
+            b = b.max(y);
+        }
+        let (x, y) = (l.floor() as i32 - 1, t.floor() as i32 - 1);
+        let (r, b) = (r.ceil() as i32 + 1, b.ceil() as i32 + 1);
+        Some(RectPx::new(
+            x,
+            y,
+            (r - x).max(1) as u32,
+            (b - y).max(1) as u32,
+        ))
+    }
+
+    fn raw_bounds(&self) -> Option<RectPx> {
         let (left, top, right, bottom, pad) = match self.kind {
             k if is_brush(k) => {
                 let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -115,6 +153,14 @@ impl Mark {
                 let radius = number_radius(self);
                 (self.x1, self.y1, self.x1, self.y1, radius + 2.0)
             }
+            // 选中框：外侧描边、角点和旋转手柄都在框外，`width` 为手柄外伸长度。
+            FRAME => (
+                self.x1,
+                self.y1 - self.width as f32,
+                self.x2,
+                self.y2,
+                self.font_size + 2.0,
+            ),
             TEXT => (
                 self.x1,
                 self.y1,
@@ -164,7 +210,7 @@ impl Mark {
     /// 可被重新选中并拖动的标注：图形、线条、文字、序号和画笔笔迹。
     /// 橡皮擦与马赛克/模糊依赖下方像素，移动后语义不清，不参与选择。
     pub fn movable(&self) -> bool {
-        !matches!(self.kind, ERASER | MOSAIC | BLUR)
+        !matches!(self.kind, ERASER | MOSAIC | BLUR | FRAME)
     }
 
     /// 整体平移标注，保留内容与样式。
@@ -179,12 +225,118 @@ impl Mark {
         }
     }
 
+    /// 未旋转、不含线宽的几何框 `(左, 上, 右, 下)`；缩放和旋转都以它的中心为基准。
+    pub fn geometry(&self) -> (f32, f32, f32, f32) {
+        match self.kind {
+            k if is_brush(k) => {
+                let (mut l, mut t, mut r, mut b) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                for &(x, y) in &self.points {
+                    l = l.min(x);
+                    t = t.min(y);
+                    r = r.max(x);
+                    b = b.max(y);
+                }
+                if l > r {
+                    (self.x1, self.y1, self.x1, self.y1)
+                } else {
+                    (l, t, r, b)
+                }
+            }
+            NUMBER => {
+                let radius = number_radius(self);
+                (
+                    self.x1 - radius,
+                    self.y1 - radius,
+                    self.x1 + radius,
+                    self.y1 + radius,
+                )
+            }
+            TEXT => (
+                self.x1,
+                self.y1,
+                self.x1 + self.extent.0,
+                self.y1 + self.extent.1,
+            ),
+            _ => {
+                let end = self.shape_end();
+                (
+                    self.x1.min(end.0),
+                    self.y1.min(end.1),
+                    self.x1.max(end.0),
+                    self.y1.max(end.1),
+                )
+            }
+        }
+    }
+
+    pub fn center(&self) -> (f32, f32) {
+        let (l, t, r, b) = self.geometry();
+        ((l + r) / 2.0, (t + b) / 2.0)
+    }
+
+    /// 线条和笔迹的旋转直接改写坐标；其余标注记录角度，绘制时旋转。
+    fn bakes_rotation(&self) -> bool {
+        matches!(self.kind, LINE | ARROW) || is_brush(self.kind)
+    }
+
+    /// 以 `center` 为中心等比缩放。线宽保持不变，文字和序号的字号随之缩放。
+    pub fn scale_about(&mut self, factor: f32, center: (f32, f32)) {
+        let f = |v: f32, c: f32| c + (v - c) * factor;
+        self.x1 = f(self.x1, center.0);
+        self.y1 = f(self.y1, center.1);
+        self.x2 = f(self.x2, center.0);
+        self.y2 = f(self.y2, center.1);
+        for point in &mut self.points {
+            *point = (f(point.0, center.0), f(point.1, center.1));
+        }
+        if matches!(self.kind, TEXT | NUMBER) {
+            self.font_size *= factor;
+            self.extent = (self.extent.0 * factor, self.extent.1 * factor);
+            if self.text_width.is_finite() {
+                self.text_width *= factor;
+            }
+        }
+    }
+
+    /// 绕 `center` 旋转 `delta` 弧度。
+    pub fn rotate_about(&mut self, delta: f32, center: (f32, f32)) {
+        if !self.bakes_rotation() {
+            // 角度绕自身中心生效；中心不同时先把自身中心转到新位置。
+            let own = self.center();
+            let moved = rotate_point(own, delta, center);
+            self.translate(moved.0 - own.0, moved.1 - own.1);
+            self.angle = normalize_angle(self.angle + delta);
+            return;
+        }
+        let r = |p: (f32, f32)| rotate_point(p, delta, center);
+        (self.x1, self.y1) = r((self.x1, self.y1));
+        (self.x2, self.y2) = r((self.x2, self.y2));
+        for point in &mut self.points {
+            *point = r(*point);
+        }
+    }
+
+    /// 绘制时附加的旋转（绕自身中心）。
+    fn rotation(&self, transform: Transform) -> Transform {
+        if self.angle == 0.0 {
+            return transform;
+        }
+        let (cx, cy) = self.center();
+        transform.pre_concat(Transform::from_rotate_at(self.angle.to_degrees(), cx, cy))
+    }
+
     /// 物理坐标 `(x, y)` 是否落在标注上；`tolerance` 为额外的命中容差。
     /// 线条和笔迹按到路径的距离判断，图形、文字和序号按外接范围判断。
     pub fn hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
         if !self.movable() {
             return false;
         }
+        // 旋转过的标注：把指针反向转回标注自身的坐标系再判断。
+        let (x, y) = if self.angle == 0.0 {
+            (x, y)
+        } else {
+            rotate_point((x, y), -self.angle, self.center())
+        };
         match self.kind {
             LINE | ARROW => {
                 let reach = self.width.max(1) as f32 / 2.0 + tolerance;
@@ -200,7 +352,7 @@ impl Mark {
                         .any(|w| segment_distance((x, y), w[0], w[1]) <= reach),
                 }
             }
-            _ => self.bounds().is_some_and(|b| {
+            _ => self.raw_bounds().is_some_and(|b| {
                 let t = tolerance;
                 x >= b.x as f32 - t
                     && y >= b.y as f32 - t
@@ -209,6 +361,21 @@ impl Mark {
             }),
         }
     }
+}
+
+pub fn rotate_point(p: (f32, f32), angle: f32, center: (f32, f32)) -> (f32, f32) {
+    let (sin, cos) = angle.sin_cos();
+    let (dx, dy) = (p.0 - center.0, p.1 - center.1);
+    (
+        center.0 + dx * cos - dy * sin,
+        center.1 + dx * sin + dy * cos,
+    )
+}
+
+fn normalize_angle(angle: f32) -> f32 {
+    let turn = std::f32::consts::TAU;
+    let a = angle.rem_euclid(turn);
+    if a > turn / 2.0 { a - turn } else { a }
 }
 
 fn segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
@@ -324,10 +491,12 @@ pub fn render_layer(
                 }
             }
             MOSAIC | BLUR => draw_effect(target, origin, area, marks, index, source, fonts),
-            RECTANGLE | SQUARE | CIRCLE => draw_shape(target, mark, transform),
+            RECTANGLE | SQUARE | CIRCLE => draw_shape(target, mark, mark.rotation(transform)),
             LINE | ARROW => draw_line(target, mark, transform),
-            NUMBER => draw_number(target, mark, transform, fonts),
+            NUMBER => draw_number(target, mark, mark.rotation(transform), fonts),
+            FRAME => draw_frame(target, mark, mark.rotation(transform)),
             TEXT => {
+                let transform = mark.rotation(transform);
                 let paint = paint(mark.color);
                 fonts.text(
                     &mark.text,
@@ -340,6 +509,42 @@ pub fn render_layer(
             }
             _ => {}
         }
+    }
+}
+
+/// 选中框：白底蓝线的细框、四角方形缩放点、顶边中点向外的旋转手柄。
+fn draw_frame(target: &mut PixmapMut<'_>, mark: &Mark, transform: Transform) {
+    let (l, t, r, b) = (mark.x1, mark.y1, mark.x2, mark.y2);
+    let half = mark.font_size;
+    let unit = (half / 5.0).max(1.0);
+    let blue = paint([10, 132, 255, 255]);
+    let white = paint([255, 255, 255, 255]);
+    let stroke = |width: f32| Stroke {
+        width,
+        ..Stroke::default()
+    };
+    let top_mid = ((l + r) / 2.0, t);
+    let knob = (top_mid.0, t - mark.width as f32);
+    let mut lines = PathBuilder::new();
+    if let Some(rect) = Rect::from_ltrb(l, t, r.max(l + 1.0), b.max(t + 1.0)) {
+        lines.push_rect(rect);
+    }
+    lines.move_to(top_mid.0, top_mid.1);
+    lines.line_to(knob.0, knob.1);
+    if let Some(path) = lines.finish() {
+        target.stroke_path(&path, &white, &stroke(unit * 3.0), transform, None);
+        target.stroke_path(&path, &blue, &stroke(unit * 1.5), transform, None);
+    }
+    let mut handles = PathBuilder::new();
+    for (x, y) in [(l, t), (r, t), (l, b), (r, b)] {
+        if let Some(rect) = Rect::from_xywh(x - half, y - half, half * 2.0, half * 2.0) {
+            handles.push_rect(rect);
+        }
+    }
+    handles.push_circle(knob.0, knob.1, half * 1.1);
+    if let Some(path) = handles.finish() {
+        target.fill_path(&path, &white, FillRule::Winding, transform, None);
+        target.stroke_path(&path, &blue, &stroke(unit * 1.5), transform, None);
     }
 }
 
@@ -822,5 +1027,44 @@ mod tests {
         pen.translate(5.0, -3.0);
         assert_eq!(pen.points, vec![(15.0, 7.0), (65.0, 7.0), (65.0, 57.0)]);
         assert_eq!((pen.x1, pen.y1, pen.x2, pen.y2), (15.0, 7.0, 65.0, 57.0));
+    }
+
+    #[test]
+    fn rotated_rectangle_renders_hits_and_bounds_follow_angle() {
+        let src = source(120, 120);
+        // 80×20 的横条绕中心 (60, 60) 转 90° 后变成竖条。
+        let mut rect = Mark::new(RECTANGLE, 20.0, 50.0, [255, 0, 0, 255], 4);
+        rect.update(100.0, 70.0);
+        rect.rotate_about(std::f32::consts::FRAC_PI_2, rect.center());
+        let drawn = layer(&[rect.clone()], &src, (0, 0), (120, 120));
+        // 竖条的上边缘在 y≈21，原来横条的左边缘 x≈21 处不再有像素。
+        assert_eq!(drawn.pixel(60, 21).unwrap().alpha(), 255);
+        assert_eq!(drawn.pixel(21, 60).unwrap().alpha(), 0);
+        assert!(rect.hit(60.0, 22.0, 2.0));
+        assert!(!rect.hit(22.0, 60.0, 2.0));
+        let b = rect.bounds().unwrap();
+        assert!(
+            b.x >= 45 && b.right() <= 75 && b.y <= 20 && b.bottom() >= 100,
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn scaling_keeps_aspect_and_lines_rotate_their_endpoints() {
+        let mut rect = Mark::new(RECTANGLE, 10.0, 10.0, [255, 0, 0, 255], 4);
+        rect.update(50.0, 30.0);
+        rect.scale_about(2.0, rect.center());
+        assert_eq!(rect.geometry(), (-10.0, 0.0, 70.0, 40.0));
+        let mut text = Mark::new(TEXT, 0.0, 0.0, [0; 4], 1);
+        text.font_size = 20.0;
+        text.extent = (40.0, 25.0);
+        text.scale_about(0.5, (0.0, 0.0));
+        assert_eq!((text.font_size, text.extent), (10.0, (20.0, 12.5)));
+        let mut arrow = Mark::new(ARROW, 0.0, 0.0, [255, 0, 0, 255], 4);
+        arrow.update(100.0, 0.0);
+        arrow.rotate_about(std::f32::consts::FRAC_PI_2, arrow.center());
+        assert_eq!(arrow.angle, 0.0, "线条直接改写坐标");
+        assert!((arrow.x1 - 50.0).abs() < 1e-3 && (arrow.y1 + 50.0).abs() < 1e-3);
+        assert!((arrow.x2 - 50.0).abs() < 1e-3 && (arrow.y2 - 50.0).abs() < 1e-3);
     }
 }

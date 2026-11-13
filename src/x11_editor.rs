@@ -578,9 +578,7 @@ impl Editor {
         let size = (self.output.width, self.output.height);
         let caret = self.core.caret_rect();
         let core = &mut self.core;
-        let pending = core.pending.take();
-        let has_pending = pending.is_some();
-        core.marks.extend(pending);
+        let overlay = core.push_overlay();
         let marks = std::mem::take(&mut core.marks);
         let result = if core.capturing {
             self.scratch
@@ -606,9 +604,7 @@ impl Editor {
             Ok(())
         };
         core.marks = marks;
-        if has_pending {
-            core.pending = core.marks.pop();
-        }
+        core.pop_overlay(overlay);
         result?;
         self.core.dirty = false;
         if self.core.capturing {

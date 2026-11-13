@@ -44,18 +44,30 @@ pub enum Cursor {
     Brush(u32),
 }
 
-/// 撤销栈中的一步编辑；标注本身保存在 `marks` 中，移动只记录位移。
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// 撤销栈中的一步编辑；标注本身保存在 `marks` 中，移动只记录位移，
+/// 缩放和旋转记录变换前的标注。
+#[derive(Clone, Debug, PartialEq)]
 pub enum Edit {
     Add,
     Move { index: usize, dx: f32, dy: f32 },
+    Transform { index: usize, before: Box<Mark> },
 }
 
-/// 重做栈：撤销“新增”时保留被移除的标注，撤销“移动”只需位移。
+/// 重做栈：撤销“新增”时保留被移除的标注，撤销“移动”只需位移，
+/// 撤销变换时保留变换后的标注。
 #[derive(Clone, Debug)]
 pub enum Redo {
     Add(Mark),
     Move { index: usize, dx: f32, dy: f32 },
+    Transform { index: usize, after: Box<Mark> },
+}
+
+/// 选中框上的控制点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handle {
+    /// 四角等比缩放；参数为角号：0 左上、1 右上、2 左下、3 右下。
+    Scale(u8),
+    Rotate,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +90,14 @@ pub enum PointerDrag {
         index: usize,
         last: (f32, f32),
         moved: (f32, f32),
+    },
+    /// 拖动选中框的控制点；`start` 为按下时到中心的距离（缩放）或角度（旋转）。
+    /// 变换前的标注保存在 `Core::transform_origin`。
+    TransformMark {
+        index: usize,
+        handle: Handle,
+        center: (f32, f32),
+        start: f32,
     },
     Toolbar {
         offset: (f64, f64),
@@ -110,6 +130,9 @@ pub struct Core {
     pub fonts: Fonts,
     pub marks: Vec<Mark>,
     pub pending: Option<Mark>,
+    /// 无工具时点中的标注，显示选中框和缩放/旋转控制点。
+    pub picked: Option<usize>,
+    pub transform_origin: Option<Mark>,
     pub edits: Vec<Edit>,
     pub redo: Vec<Redo>,
     pub text_editing: bool,
@@ -165,6 +188,8 @@ impl Core {
             fonts: Fonts::new(),
             marks: Vec::new(),
             pending: None,
+            picked: None,
+            transform_origin: None,
             edits: Vec::new(),
             redo: Vec::new(),
             text_editing: false,
@@ -198,6 +223,7 @@ impl Core {
     /// 选区外仍显示原截图的遮罩，与普通截图编辑页一致。已有标注按选区原点平移。
     pub fn enter_canvas(&mut self, image: ShmImage) {
         self.commit_pending();
+        self.picked = None;
         let window = self.selection;
         for mark in &mut self.marks {
             mark.translate(-window.x as f32, -window.y as f32);
@@ -442,6 +468,116 @@ impl Core {
         }
     }
 
+    /// 选中框（仅显示用的 `FRAME` 标注）：只在无工具、已选中标注时出现。
+    pub fn frame_mark(&self) -> Option<Mark> {
+        if self.ui.tool != 0 || !self.ui.editing || self.capturing {
+            return None;
+        }
+        let mark = self.marks.get(self.picked?)?;
+        let scale = self.scale();
+        let stroke = match mark.kind {
+            marks::HIGHLIGHTER => mark.width.saturating_mul(3).clamp(6, 192) as f32 / 2.0,
+            marks::ARROW => (mark.width.max(1) as f32 * 4.0).max(14.0) / 2.0,
+            k if k == marks::LINE || marks::is_brush(k) => mark.width.max(1) as f32 / 2.0,
+            _ => 0.0,
+        };
+        let pad = stroke + 6.0 * scale;
+        let (l, t, r, b) = mark.geometry();
+        let mut frame = Mark::new(marks::FRAME, l - pad, t - pad, [0; 4], 1);
+        frame.x2 = r + pad;
+        frame.y2 = b + pad;
+        // `width` 为旋转手柄外伸长度，`font_size` 为控制点半边长。
+        frame.width = (28.0 * scale).round() as u32;
+        frame.font_size = 5.0 * scale;
+        frame.angle = mark.angle;
+        Some(frame)
+    }
+
+    fn damage_frame(&mut self) {
+        let bounds = self.frame_mark().and_then(|frame| frame.bounds());
+        self.damage(bounds);
+    }
+
+    /// 改变选中的标注，并重绘新旧选中框。
+    pub fn pick(&mut self, index: Option<usize>) {
+        if self.picked == index {
+            return;
+        }
+        self.damage_frame();
+        self.picked = index;
+        self.damage_frame();
+        self.dirty = true;
+    }
+
+    /// 指针（逻辑坐标）下的选中框控制点。
+    pub fn handle_at(&self, position: (f64, f64)) -> Option<(usize, Handle)> {
+        let frame = self.frame_mark()?;
+        let index = self.picked?;
+        let center = ((frame.x1 + frame.x2) / 2.0, (frame.y1 + frame.y2) / 2.0);
+        let p = marks::rotate_point(self.to_physical(position), -frame.angle, center);
+        let reach = frame.font_size * 2.0;
+        let knob = (center.0, frame.y1 - frame.width as f32);
+        if (p.0 - knob.0).hypot(p.1 - knob.1) <= reach * 1.2 {
+            return Some((index, Handle::Rotate));
+        }
+        let corners = [
+            (frame.x1, frame.y1),
+            (frame.x2, frame.y1),
+            (frame.x1, frame.y2),
+            (frame.x2, frame.y2),
+        ];
+        corners
+            .iter()
+            .position(|c| (p.0 - c.0).abs() <= reach && (p.1 - c.1).abs() <= reach)
+            .map(|corner| (index, Handle::Scale(corner as u8)))
+    }
+
+    /// 绘制前把正在绘制的标注和选中框临时追加到 `marks` 末尾；
+    /// 返回值交给 `pop_overlay` 还原。
+    pub fn push_overlay(&mut self) -> (bool, bool) {
+        let pending = self.pending.take();
+        let has_pending = pending.is_some();
+        self.marks.extend(pending);
+        let frame = self.frame_mark();
+        let has_frame = frame.is_some();
+        self.marks.extend(frame);
+        (has_pending, has_frame)
+    }
+
+    pub fn pop_overlay(&mut self, (pending, frame): (bool, bool)) {
+        if frame {
+            self.marks.pop();
+        }
+        if pending {
+            self.pending = self.marks.pop();
+        }
+    }
+
+    /// 用变换后的标注替换第 `index` 条，并重绘受影响的范围（含其上的马赛克/模糊）。
+    fn replace_mark(&mut self, index: usize, mark: Mark) {
+        let Some(old) = self.marks.get(index).map(Mark::bounds) else {
+            return;
+        };
+        self.damage_frame();
+        let damage = match (old, mark.bounds()) {
+            (Some(a), Some(b)) => Some(marks::union(Some(a), b)),
+            (a, b) => a.or(b),
+        };
+        self.marks[index] = mark;
+        let effects: Vec<RectPx> = self.marks[index + 1..]
+            .iter()
+            .filter(|m| matches!(m.kind, marks::MOSAIC | marks::BLUR))
+            .filter_map(Mark::bounds)
+            .filter(|b| damage.and_then(|d| marks::intersect(*b, d)).is_some())
+            .collect();
+        self.damage(damage);
+        for rect in effects {
+            self.damage(Some(rect));
+        }
+        self.damage_frame();
+        self.dirty = true;
+    }
+
     /// 最上层被 `position`（逻辑坐标）命中的可移动标注。
     pub fn mark_at(&self, position: (f64, f64)) -> Option<usize> {
         let (x, y) = self.to_physical(position);
@@ -453,6 +589,7 @@ impl Core {
 
     pub fn undo(&mut self) {
         self.commit_pending();
+        self.damage_frame();
         match self.edits.pop() {
             Some(Edit::Add) => {
                 if let Some(mark) = self.marks.pop() {
@@ -464,13 +601,32 @@ impl Core {
                 self.shift_mark(index, -dx, -dy);
                 self.redo.push(Redo::Move { index, dx, dy });
             }
+            Some(Edit::Transform { index, before }) => {
+                if let Some(after) = self.marks.get(index).cloned() {
+                    self.replace_mark(index, *before);
+                    self.redo.push(Redo::Transform {
+                        index,
+                        after: Box::new(after),
+                    });
+                }
+            }
             None => {}
         }
+        self.drop_stale_pick();
         self.update_next_number();
+    }
+
+    /// 撤销新增后选中的标注可能已不存在。
+    fn drop_stale_pick(&mut self) {
+        if self.picked.is_some_and(|index| index >= self.marks.len()) {
+            self.picked = None;
+        }
+        self.dirty = true;
     }
 
     pub fn redo(&mut self) {
         self.commit_pending();
+        self.damage_frame();
         match self.redo.pop() {
             Some(Redo::Add(mark)) => {
                 self.damage(mark.bounds());
@@ -481,8 +637,18 @@ impl Core {
                 self.shift_mark(index, dx, dy);
                 self.edits.push(Edit::Move { index, dx, dy });
             }
+            Some(Redo::Transform { index, after }) => {
+                if let Some(before) = self.marks.get(index).cloned() {
+                    self.replace_mark(index, *after);
+                    self.edits.push(Edit::Transform {
+                        index,
+                        before: Box::new(before),
+                    });
+                }
+            }
             None => {}
         }
+        self.drop_stale_pick();
         self.update_next_number();
     }
 
@@ -713,13 +879,43 @@ impl Core {
             PointerDrag::MoveMark { index, last, moved } => {
                 let (dx, dy) = (physical.0 - last.0, physical.1 - last.1);
                 if dx != 0.0 || dy != 0.0 {
+                    self.damage_frame();
                     self.shift_mark(index, dx, dy);
+                    self.damage_frame();
                     self.pointer_drag = Some(PointerDrag::MoveMark {
                         index,
                         last: physical,
                         moved: (moved.0 + dx, moved.1 + dy),
                     });
                 }
+            }
+            PointerDrag::TransformMark {
+                index,
+                handle,
+                center,
+                start,
+            } => {
+                let Some(mut mark) = self.transform_origin.clone() else {
+                    return;
+                };
+                let (dx, dy) = (physical.0 - center.0, physical.1 - center.1);
+                match handle {
+                    Handle::Scale(_) => {
+                        let factor = (dx.hypot(dy) / start.max(1.0)).clamp(0.05, 20.0);
+                        mark.scale_about(factor, center);
+                    }
+                    Handle::Rotate => {
+                        let mut delta = dy.atan2(dx) - start;
+                        if self.shift {
+                            // Shift：最终角度吸附到 15° 的整数倍。
+                            let step = 15f32.to_radians();
+                            let target = ((mark.angle + delta) / step).round() * step;
+                            delta = target - mark.angle;
+                        }
+                        mark.rotate_about(delta, center);
+                    }
+                }
+                self.replace_mark(index, mark);
             }
             PointerDrag::Toolbar { offset } => {
                 let screen = self.logical;
@@ -771,6 +967,10 @@ impl Core {
 
     pub fn set_ui_from_action(&mut self, action: Action) {
         let tool_before = self.ui.tool;
+        if matches!(action, Action::Tool(_)) {
+            // 选用工具后不再显示选中框。
+            self.pick(None);
+        }
         match action {
             Action::Tool(tool) => {
                 self.ui.menu = None;
@@ -865,6 +1065,18 @@ impl Core {
         }
         if let Some(PointerDrag::Move { .. } | PointerDrag::MoveMark { .. }) = self.pointer_drag {
             return Cursor::Grabbing;
+        }
+        let handle = match self.pointer_drag {
+            Some(PointerDrag::TransformMark { handle, .. }) => Some(handle),
+            Some(_) => None,
+            None => self.handle_at(position).map(|(_, handle)| handle),
+        };
+        match handle {
+            Some(Handle::Rotate) => return Cursor::Grabbing,
+            // 左上/右下与右上/左下两组斜向箭头（选中框旋转后仍按原角显示）。
+            Some(Handle::Scale(0 | 3)) => return Cursor::Resize(5),
+            Some(Handle::Scale(_)) => return Cursor::Resize(6),
+            None => {}
         }
         let selected = self.ui_selection();
         if self.ui.hit(self.logical, selected, position).is_some()
@@ -997,8 +1209,32 @@ impl Core {
         } else {
             selection_edge(selected, position)
         };
-        if edge != 0 {
+        let handle = (self.ui.tool == 0)
+            .then(|| self.handle_at(position))
+            .flatten();
+        if let Some((index, handle)) = handle {
+            // 选中框的控制点优先于选区边缘：缩放或旋转选中的标注。
             self.commit_pending();
+            let Some(mark) = self.marks.get(index).cloned() else {
+                return;
+            };
+            let center = mark.center();
+            let p = self.to_physical(position);
+            let (dx, dy) = (p.0 - center.0, p.1 - center.1);
+            let start = match handle {
+                Handle::Scale(_) => dx.hypot(dy),
+                Handle::Rotate => dy.atan2(dx),
+            };
+            self.transform_origin = Some(mark);
+            self.pointer_drag = Some(PointerDrag::TransformMark {
+                index,
+                handle,
+                center,
+                start,
+            });
+        } else if edge != 0 {
+            self.commit_pending();
+            self.pick(None);
             self.pointer_drag = Some(PointerDrag::Resize {
                 start: position,
                 origin: self.selection,
@@ -1011,7 +1247,8 @@ impl Core {
                 self.mark_at(position)
             }
         {
-            // 无工具时先命中已有标注：拖动标注；空白处仍然移动选区。
+            // 无工具时先命中已有标注：选中并拖动；空白处仍然移动选区。
+            self.pick(Some(index));
             self.pointer_drag = Some(PointerDrag::MoveMark {
                 index,
                 last: self.to_physical(position),
@@ -1019,6 +1256,7 @@ impl Core {
             });
         } else if selected.contains(position) && self.ui.tool == 0 && !self.canvas {
             self.commit_pending();
+            self.pick(None);
             self.pointer_drag = Some(PointerDrag::Move {
                 start: position,
                 origin: self.selection,
@@ -1056,6 +1294,16 @@ impl Core {
                 dy: moved.1,
             });
             self.redo.clear();
+        } else if let Some(PointerDrag::TransformMark { index, .. }) = drag {
+            if let Some(before) = self.transform_origin.take()
+                && self.marks.get(index).is_some_and(|after| *after != before)
+            {
+                self.edits.push(Edit::Transform {
+                    index,
+                    before: Box::new(before),
+                });
+                self.redo.clear();
+            }
         } else if matches!(
             drag,
             Some(PointerDrag::Select { .. } | PointerDrag::Resize { .. })
@@ -1126,6 +1374,8 @@ impl Core {
             Keysym::Escape => {
                 if self.ui.menu.is_some() {
                     self.ui.menu = None;
+                } else if self.picked.is_some() && self.ui.tool == 0 {
+                    self.pick(None);
                 } else if self.pending.is_some() {
                     let bounds = self.pending.take().and_then(|mark| mark.bounds());
                     self.pointer_drag = None;

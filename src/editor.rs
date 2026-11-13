@@ -323,9 +323,8 @@ impl NativeEditor {
             scene.damage(rect);
         }
         let core = &mut self.core;
-        let pending = core.pending.take();
-        let has_pending = pending.is_some();
-        core.marks.extend(pending);
+        let overlay = core.push_overlay();
+        let has_pending = overlay.0;
         let result = scene.update(
             SceneInput {
                 selection: core.selection,
@@ -338,9 +337,7 @@ impl NativeEditor {
             },
             qh,
         );
-        if has_pending {
-            core.pending = core.marks.pop();
-        }
+        core.pop_overlay(overlay);
         if let (Some(len), Some(mark)) = (committed_len, self.core.pending.as_mut()) {
             mark.text.truncate(len);
         }
@@ -512,15 +509,11 @@ impl NativeEditor {
             .canvas(&mut soft.pool)
             .ok_or("画布缓冲区仍在使用")?;
         let core = &mut self.core;
-        let pending = core.pending.take();
-        let has_pending = pending.is_some();
-        core.marks.extend(pending);
+        let overlay = core.push_overlay();
         let marks = std::mem::take(&mut core.marks);
         let result = soft_render::render(canvas, size, core, &marks, caret, &mut soft.cache);
         core.marks = marks;
-        if has_pending {
-            core.pending = core.marks.pop();
-        }
+        core.pop_overlay(overlay);
         result?;
         for pixel in canvas.chunks_exact_mut(4) {
             pixel.swap(0, 2);
