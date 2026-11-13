@@ -11,6 +11,7 @@ include!("support/longshot.rs");
 include!("support/annotate.rs");
 include!("support/pin_menu.rs");
 include!("support/x11.rs");
+include!("support/brush_cursor.rs");
 use babry::{
     compositor::{self, Backend},
     core::RectPx,

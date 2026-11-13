@@ -109,6 +109,12 @@ fn x11_editor_longshot_and_annotations() {
     }
     click(find(&idle, native_ui::Action::Tool(2)));
     drag((left + 100., top + 150.), (left + 300., top + 270.));
+    // 画笔范围光标：切到画笔后在选区内移动，编辑器不能因创建位图光标出错。
+    click(find(&idle, native_ui::Action::Tool(1)));
+    xdo(&display, &["mousemove", &s(left + 400.), &s(top + 400.)]);
+    pause(200);
+    xdo(&display, &["mousemove", &s(left + 420.), &s(top + 420.)]);
+    pause(200);
     xdo(&display, &["key", "ctrl+s"]);
     editor.wait();
     let result = newest_export(&dir.join("export"));

@@ -1281,6 +1281,50 @@ fn number(p: &mut Painter<'_>, fonts: &mut Fonts, b: BoxF, value: &str, focused:
     );
 }
 
+/// 画笔范围光标：`side`×`side` 的透明图，中心是直径 `diameter`（同一像素单位）的
+/// 圆环——外圈黑、内圈白，深浅背景都能看清；中心再画一个小十字用于定位。
+/// 返回预乘 RGBA；圆环只用黑白灰，因此可直接当作 BGRA 使用。
+pub fn brush_cursor(diameter: f32, side: u32, unit: f32) -> Option<tiny_skia::Pixmap> {
+    use tiny_skia::{Paint, PathBuilder, Stroke, Transform};
+    let mut pixmap = tiny_skia::Pixmap::new(side.max(1), side.max(1))?;
+    let c = side as f32 / 2.0;
+    let r = (diameter / 2.0).max(unit);
+    let mut paint = Paint {
+        anti_alias: true,
+        ..Paint::default()
+    };
+    let mut ring = |radius: f32, width: f32, value: u8| {
+        if let Some(path) = PathBuilder::from_circle(c, c, radius.max(0.5)) {
+            paint.set_color_rgba8(value, value, value, 255);
+            let stroke = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    };
+    // 黑色描边包住白色圆环，白环正好落在作用范围边缘。
+    ring(r, unit * 3.0, 0);
+    ring(r, unit, 255);
+    let arm = (unit * 4.0).min(r * 0.6).max(unit * 2.0);
+    for (w, value) in [(unit * 3.0, 0), (unit, 255)] {
+        let mut builder = PathBuilder::new();
+        builder.move_to(c - arm, c);
+        builder.line_to(c + arm, c);
+        builder.move_to(c, c - arm);
+        builder.line_to(c, c + arm);
+        if let Some(path) = builder.finish() {
+            paint.set_color_rgba8(value, value, value, 255);
+            let stroke = Stroke {
+                width: w,
+                ..Stroke::default()
+            };
+            pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+    }
+    Some(pixmap)
+}
+
 #[cfg(test)]
 mod shape_menu_tests {
     use super::*;

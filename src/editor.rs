@@ -114,6 +114,8 @@ pub struct NativeEditor {
     cursor_device: Option<WpCursorShapeDeviceV1>,
     cursor_serial: u32,
     cursor_shape: Option<Shape>,
+    /// 画笔范围光标：自绘圆环挂在独立的光标表面上，跟随指针无需重绘编辑器。
+    brush: BrushCursor,
     /// text-input-v3：中文等输入法的预编辑与提交。
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
@@ -135,6 +137,14 @@ pub struct NativeEditor {
     _output: Option<BoundOutput>,
 }
 
+struct BrushCursor {
+    surface: wl_surface::WlSurface,
+    pool: Option<SlotPool>,
+    buffer: Option<Buffer>,
+    /// 当前缓冲区对应的（物理直径，缓冲区整数缩放）；`None` 表示没有挂在指针上。
+    key: Option<(u32, i32)>,
+}
+
 fn shape(cursor: Cursor) -> Shape {
     match cursor {
         Cursor::Default => Shape::Default,
@@ -151,6 +161,7 @@ fn shape(cursor: Cursor) -> Shape {
         Cursor::Resize(2) => Shape::NResize,
         Cursor::Resize(3) => Shape::EResize,
         Cursor::Resize(_) => Shape::SResize,
+        Cursor::Brush(_) => Shape::Crosshair,
     }
 }
 
@@ -185,6 +196,12 @@ impl NativeEditor {
             .as_deref()
             .map(|name| compositor::bind_output(&connection, name))
             .transpose()?;
+        let brush = BrushCursor {
+            surface: compositor.create_surface(&qh),
+            pool: None,
+            buffer: None,
+            key: None,
+        };
         let surface = compositor.create_surface(&qh);
         let viewport = viewporter.get_viewport(&surface, &qh, ());
         let layer = shell.create_layer_surface(
@@ -233,6 +250,7 @@ impl NativeEditor {
             cursor_device: None,
             cursor_serial: 0,
             cursor_shape: None,
+            brush,
             text_input_manager,
             text_input: None,
             ime_focus: false,
@@ -575,13 +593,65 @@ impl NativeEditor {
     }
 
     fn update_cursor(&mut self, position: (f64, f64)) {
-        let shape = shape(self.core.cursor_for(position));
+        let cursor = self.core.cursor_for(position);
+        if let Cursor::Brush(diameter) = cursor
+            && self
+                .set_brush(diameter)
+                .inspect_err(|e| eprintln!("babry: 画笔光标失败: {e}"))
+                .is_ok()
+        {
+            self.cursor_shape = None;
+            return;
+        }
+        self.brush.key = None;
+        let shape = shape(cursor);
         if self.cursor_shape != Some(shape)
             && let Some(device) = &self.cursor_device
         {
             device.set_shape(self.cursor_serial, shape);
             self.cursor_shape = Some(shape);
         }
+    }
+}
+
+impl NativeEditor {
+    /// 把直径 `diameter`（物理像素）的圆环设为指针图像。光标表面只支持整数
+    /// `buffer_scale`，因此按向上取整的倍率绘制，由合成器缩到分数缩放。
+    fn set_brush(&mut self, diameter: u32) -> Result<(), String> {
+        let pointer = self.pointer.as_ref().ok_or("没有指针")?;
+        let scale = self.core.scale();
+        let factor = scale.ceil().max(1.0) as i32;
+        let key = (diameter, factor);
+        if self.brush.key == Some(key) {
+            return Ok(());
+        }
+        let logical = diameter as f32 / scale;
+        let side = ((logical.ceil() as u32 + 8) & !1) as i32;
+        let (width, stride) = (side * factor, side * factor * 4);
+        if self.brush.pool.is_none() {
+            self.brush.pool = Some(
+                SlotPool::new(stride as usize * width as usize, &self.shm)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let pool = self.brush.pool.as_mut().ok_or("光标内存不可用")?;
+        let (buffer, canvas) = pool
+            .create_buffer(width, width, stride, wl_shm::Format::Argb8888)
+            .map_err(|e| e.to_string())?;
+        let image =
+            babry::native_ui::brush_cursor(logical * factor as f32, width as u32, factor as f32)
+                .ok_or("光标尺寸无效")?;
+        canvas.copy_from_slice(image.data());
+        let surface = &self.brush.surface;
+        surface.set_buffer_scale(factor);
+        buffer.attach_to(surface).map_err(|e| e.to_string())?;
+        surface.damage_buffer(0, 0, width, width);
+        surface.commit();
+        pointer.set_cursor(self.cursor_serial, Some(surface), side / 2, side / 2);
+        // 旧缓冲区在新缓冲区挂上后才释放，SlotPool 会在合成器 release 后回收。
+        self.brush.buffer = Some(buffer);
+        self.brush.key = Some(key);
+        Ok(())
     }
 }
 
@@ -796,6 +866,7 @@ impl PointerHandler for NativeEditor {
                 PointerEventKind::Enter { serial } => {
                     self.cursor_serial = serial;
                     self.cursor_shape = None;
+                    self.brush.key = None;
                     self.core.pointer_enter(event.position);
                 }
                 PointerEventKind::Leave { .. } => self.core.pointer_leave(),

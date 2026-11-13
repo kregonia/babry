@@ -40,6 +40,8 @@ pub enum Cursor {
     Grabbing,
     Text,
     Resize(u8),
+    /// 画笔类工具的作用范围：直径（屏幕物理像素），前端画成双色圆环。
+    Brush(u32),
 }
 
 /// 撤销栈中的一步编辑；标注本身保存在 `marks` 中，移动只记录位移。
@@ -846,6 +848,17 @@ impl Core {
         self.dirty = true;
     }
 
+    /// 画笔、荧光笔、马赛克/模糊、橡皮擦实际落笔的直径（物理像素），与 `Mark` 的
+    /// 笔宽规则一致；其他工具返回 `None`。
+    pub fn brush_diameter(&self) -> Option<u32> {
+        let width = ((self.ui.width as f32 * self.scale()).round() as u32).max(1);
+        match self.ui.tool {
+            marks::PEN | marks::MOSAIC | marks::ERASER => Some(width),
+            marks::HIGHLIGHTER => Some(width.saturating_mul(3).clamp(6, 192)),
+            _ => None,
+        }
+    }
+
     pub fn cursor_for(&self, position: (f64, f64)) -> Cursor {
         if !self.ui.editing {
             return Cursor::Crosshair;
@@ -877,7 +890,9 @@ impl Core {
                 0 if self.mark_at(position).is_some() => Cursor::Grab,
                 0 => Cursor::Move,
                 10 => Cursor::Text,
-                _ => Cursor::Crosshair,
+                _ => self
+                    .brush_diameter()
+                    .map_or(Cursor::Crosshair, Cursor::Brush),
             },
             _ => Cursor::Default,
         }

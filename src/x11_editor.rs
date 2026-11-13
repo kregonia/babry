@@ -43,7 +43,7 @@ pub struct Session {
 }
 
 /// 光标字体中的字形编号（X11 cursorfont.h）。
-fn glyph(cursor: Cursor) -> u16 {
+fn glyph_of(cursor: Cursor) -> u16 {
     match cursor {
         Cursor::Default => 68,
         Cursor::Crosshair => 34,
@@ -58,7 +58,82 @@ fn glyph(cursor: Cursor) -> u16 {
         Cursor::Resize(2) => 138,
         Cursor::Resize(3) => 96,
         Cursor::Resize(_) => 16,
+        Cursor::Brush(_) => 34,
     }
+}
+
+/// 光标缓存键：字体字形用字形号，画笔范围圆环用 `0x10000 + 直径`。
+fn cursor_key(cursor: Cursor) -> u32 {
+    match cursor {
+        Cursor::Brush(diameter) => 0x1_0000 + diameter,
+        other => u32::from(glyph_of(other)),
+    }
+}
+
+/// 用两张 1 位位图做核心协议光标：前景白、背景黑，掩码取圆环图的不透明部分，
+/// 效果与 Wayland 的黑白双层圆环一致，不依赖 Render 扩展。
+fn brush_cursor(
+    conn: &RustConnection,
+    drawable: xproto::Window,
+    diameter: u32,
+) -> Result<xproto::Cursor, String> {
+    let side = (diameter + 8) & !1;
+    let image = native_ui::brush_cursor(diameter as f32, side, 1.0).ok_or("光标尺寸无效")?;
+    let setup = conn.setup();
+    let pad = u32::from(setup.bitmap_format_scanline_pad).max(8);
+    let stride = side.div_ceil(pad) * pad / 8;
+    let lsb = setup.bitmap_format_bit_order == xproto::ImageOrder::LSB_FIRST;
+    let mut source = vec![0u8; (stride * side) as usize];
+    let mut mask = source.clone();
+    for (i, px) in image.data().chunks_exact(4).enumerate() {
+        let (x, y) = (i as u32 % side, i as u32 / side);
+        let byte = (y * stride + x / 8) as usize;
+        let bit = if lsb { 1 << (x % 8) } else { 0x80 >> (x % 8) };
+        if px[3] >= 96 {
+            mask[byte] |= bit;
+            // 预乘后的亮度超过一半算白色。
+            if u32::from(px[0]) * 2 >= u32::from(px[3]) {
+                source[byte] |= bit;
+            }
+        }
+    }
+    let e = |e: x11rb::errors::ConnectionError| e.to_string();
+    let gc = conn.generate_id().map_err(|e| e.to_string())?;
+    let mut pixmaps = [0; 2];
+    for (index, (pixmap, bits)) in pixmaps.iter_mut().zip([&source, &mask]).enumerate() {
+        *pixmap = conn.generate_id().map_err(|e| e.to_string())?;
+        conn.create_pixmap(1, *pixmap, drawable, side as u16, side as u16)
+            .map_err(e)?;
+        if index == 0 {
+            // 深度为 1 的 GC 在第一张位图上创建，两张共用。
+            conn.create_gc(gc, *pixmap, &CreateGCAux::new().foreground(1).background(0))
+                .map_err(e)?;
+        }
+        conn.put_image(
+            ImageFormat::XY_PIXMAP,
+            *pixmap,
+            gc,
+            side as u16,
+            side as u16,
+            0,
+            0,
+            0,
+            1,
+            bits,
+        )
+        .map_err(e)?;
+    }
+    let cursor = conn.generate_id().map_err(|e| e.to_string())?;
+    let hot = (side / 2) as u16;
+    conn.create_cursor(
+        cursor, pixmaps[0], pixmaps[1], 0xffff, 0xffff, 0xffff, 0, 0, 0, hot, hot,
+    )
+    .map_err(e)?;
+    for pixmap in pixmaps {
+        let _ = conn.free_pixmap(pixmap);
+    }
+    let _ = conn.free_gc(gc);
+    Ok(cursor)
 }
 
 /// 一块与 X 服务器共享的帧缓冲区；没有 MIT-SHM 时 `seg` 为 `None`。
@@ -219,8 +294,8 @@ struct Editor {
     cache: SoftCache,
     keymap: Keymap,
     cursor_font: xproto::Font,
-    cursors: Vec<(u16, xproto::Cursor)>,
-    cursor: Option<u16>,
+    cursors: Vec<(u32, xproto::Cursor)>,
+    cursor: Option<u32>,
     capture: Option<Capture>,
     /// 长截图开始时截下的屏幕，用作小窗口圆角和阴影下的底色。
     under: Option<ShmImage>,
@@ -444,33 +519,46 @@ impl Editor {
     }
 
     fn update_cursor(&mut self, window: xproto::Window, position: (f64, f64)) {
-        let glyph = if self.core.capturing {
-            68
+        let shape = if self.core.capturing {
+            Cursor::Default
         } else {
-            glyph(self.core.cursor_for(position))
+            self.core.cursor_for(position)
         };
+        let glyph = cursor_key(shape);
         if self.cursor == Some(glyph) && window == self.window {
             return;
         }
         let cursor = match self.cursors.iter().find(|(g, _)| *g == glyph) {
             Some(&(_, cursor)) => cursor,
             None => {
-                let Ok(id) = self.conn.generate_id() else {
-                    return;
+                let id = match shape {
+                    Cursor::Brush(diameter) => {
+                        match brush_cursor(&self.conn, self.window, diameter) {
+                            Ok(id) => id,
+                            Err(_) => return,
+                        }
+                    }
+                    other => {
+                        let Ok(id) = self.conn.generate_id() else {
+                            return;
+                        };
+                        let g = glyph_of(other);
+                        let _ = self.conn.create_glyph_cursor(
+                            id,
+                            self.cursor_font,
+                            self.cursor_font,
+                            g,
+                            g + 1,
+                            0,
+                            0,
+                            0,
+                            0xffff,
+                            0xffff,
+                            0xffff,
+                        );
+                        id
+                    }
                 };
-                let _ = self.conn.create_glyph_cursor(
-                    id,
-                    self.cursor_font,
-                    self.cursor_font,
-                    glyph,
-                    glyph + 1,
-                    0,
-                    0,
-                    0,
-                    0xffff,
-                    0xffff,
-                    0xffff,
-                );
                 self.cursors.push((glyph, id));
                 id
             }
